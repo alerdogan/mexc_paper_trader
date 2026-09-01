@@ -10,6 +10,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 BASE=Path(__file__).parent; DB=BASE/'trader.db'; app=FastAPI(title='MEXC Futures Paper Trader'); templates=Jinja2Templates(directory=str(BASE/'templates'))
+SERVICE_STARTED_MONOTONIC=time.monotonic()
 DEFAULTS={"symbols":["BTC_USDT"],"top_volume_count":30,"universe_refresh_minutes":15,"paper_balance":4000.0,"risk_per_trade_usd":20.0,"max_alt_notional_usd":5000.0,"max_btc_notional_usd":10000.0,"max_total_open_risk_usd":100.0,"daily_loss_limit_usd":300.0,"leverage":2,"signal_threshold":80,"scan_seconds":30,"stop_atr_mult":1.5,"tp1_r":1.0,"tp1_pct":30.0,"tp2_r":2.0,"tp2_pct":30.0,"runner_pct":40.0,"move_be_at_r":1.0,"min_free_balance_pct":20.0,"paper_fee_rate":0.0008}
 settings=DEFAULTS.copy(); state={"running":False,"panic":False,"last_scan":None,"market":{},"live_prices":{},"last_price_update":None,"scanning":False,"error":None,"feed":"MEXC FUTURES","public_api":None,"api_saved":False,"private_api":None,"paper_test_threshold":None,"universe":[],"universe_updated":None,"scan_duration_sec":None,"rate_limit_wait":None}
 TASK_NAMES=('scanner','position_engine','ghost_analyzer')
@@ -871,11 +872,13 @@ def health():
  return {
   'service_status':'healthy' if database_ok and all_alive else 'degraded',
   'mode':'PAPER',
+  'mexc_api_connection':state.get('public_api') or 'NOT_TESTED',
   'scanner':tasks['scanner'],
   'position_engine':tasks['position_engine'],
   'ghost_analyzer':tasks['ghost_analyzer'],
   'last_successful_market_data_timestamp':max(timestamps) if timestamps else None,
   'database_connectivity':database_ok,
+  'uptime_seconds':max(0,int(time.monotonic()-SERVICE_STARTED_MONOTONIC)),
  }
 @app.get('/api/status')
 def status():

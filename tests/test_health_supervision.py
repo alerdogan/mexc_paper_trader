@@ -25,12 +25,16 @@ def test_health_reports_safe_task_and_database_status(isolated_app):
     mark_all_tasks_running(module)
     module.state["last_scan"] = "2026-09-01T12:00:00"
     module.state["last_price_update"] = "2026-09-01T12:00:03"
+    module.state["public_api"] = "BAĞLI"
 
     result = module.health()
 
     assert result["service_status"] == "healthy"
     assert result["mode"] == "PAPER"
     assert result["database_connectivity"] is True
+    assert result["mexc_api_connection"] == "BAĞLI"
+    assert isinstance(result["uptime_seconds"], int)
+    assert result["uptime_seconds"] >= 0
     assert result["last_successful_market_data_timestamp"] == "2026-09-01T12:00:03"
     for name in module.TASK_NAMES:
         assert result[name]["alive"] is True
@@ -124,3 +128,20 @@ def test_supervisor_backoff_is_bounded_and_non_decreasing():
     assert app.SUPERVISOR_BACKOFF
     assert tuple(sorted(app.SUPERVISOR_BACKOFF)) == app.SUPERVISOR_BACKOFF
     assert app.SUPERVISOR_BACKOFF[-1] <= 30
+
+
+def test_dashboard_contains_compact_health_panel():
+    template = (app.BASE / "templates" / "index.html").read_text()
+
+    assert "Sistem Sağlığı" in template
+    assert "fetch('/api/health')" in template
+    for element_id in (
+        "healthMexc",
+        "healthScanner",
+        "healthPosition",
+        "healthGhost",
+        "healthDatabase",
+        "healthMarketData",
+        "healthUptime",
+    ):
+        assert f'id="{element_id}"' in template
