@@ -14,6 +14,8 @@ SERVICE_STARTED_MONOTONIC=time.monotonic()
 DEFAULTS={"symbols":["BTC_USDT"],"top_volume_count":30,"universe_refresh_minutes":15,"paper_balance":4000.0,"risk_per_trade_usd":20.0,"max_alt_notional_usd":5000.0,"max_btc_notional_usd":10000.0,"max_total_open_risk_usd":100.0,"daily_loss_limit_usd":300.0,"leverage":2,"signal_threshold":80,"scan_seconds":30,"stop_atr_mult":1.5,"tp1_r":1.0,"tp1_pct":30.0,"tp2_r":2.0,"tp2_pct":30.0,"runner_pct":40.0,"move_be_at_r":1.0,"min_free_balance_pct":20.0,"paper_fee_rate":0.0008}
 settings=DEFAULTS.copy(); state={"running":False,"panic":False,"last_scan":None,"market":{},"live_prices":{},"last_price_update":None,"scanning":False,"error":None,"feed":"MEXC FUTURES","public_api":None,"api_saved":False,"private_api":None,"paper_test_threshold":None,"universe":[],"universe_updated":None,"scan_duration_sec":None,"rate_limit_wait":None}
 TASK_NAMES=('scanner','position_engine','ghost_analyzer')
+STRATEGY_LAB_MODELS=('CURRENT','NO_STOP_MINI','SMART_EXIT')
+STRATEGY_LAB_VERSION='1.0'
 SUPERVISOR_BACKOFF=(1,2,5,10,30)
 background_tasks={}
 
@@ -72,6 +74,21 @@ def init_db():
   c.execute('ALTER TABLE positions ADD COLUMN stop_analysis_source TEXT')
  if 'stop_analysis_at' not in cols:
   c.execute('ALTER TABLE positions ADD COLUMN stop_analysis_at TEXT')
+ c.execute('''CREATE TABLE IF NOT EXISTS strategy_lab_experiments(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,source_position_id INTEGER NOT NULL UNIQUE,
+  symbol TEXT NOT NULL,side TEXT NOT NULL,entry REAL NOT NULL,initial_stop REAL NOT NULL,
+  qty REAL NOT NULL,score REAL,opened_at TEXT NOT NULL,current_stopped_at TEXT,created_at TEXT NOT NULL
+ )''')
+ c.execute('''CREATE TABLE IF NOT EXISTS strategy_lab_runs(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,experiment_id INTEGER NOT NULL,model TEXT NOT NULL,
+  model_version TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'OPEN',entry REAL NOT NULL,
+  stop REAL NOT NULL,qty REAL NOT NULL,remaining_qty REAL NOT NULL,realized_pnl REAL NOT NULL DEFAULT 0,
+  fee_paid REAL NOT NULL DEFAULT 0,tp1_done INTEGER NOT NULL DEFAULT 0,tp2_done INTEGER NOT NULL DEFAULT 0,
+  mae_r REAL NOT NULL DEFAULT 0,mfe_r REAL NOT NULL DEFAULT 0,stop_triggered_at TEXT,
+  first_post_stop_profit_at TEXT,closed_at TEXT,close_price REAL,close_reason TEXT,updated_at TEXT NOT NULL,
+  UNIQUE(experiment_id,model),FOREIGN KEY(experiment_id) REFERENCES strategy_lab_experiments(id)
+ )''')
+ c.execute('CREATE INDEX IF NOT EXISTS idx_strategy_lab_runs_status ON strategy_lab_runs(status)')
  # Existing open positions can only be tracked accurately from this upgrade forward.
  now_iso=datetime.now().isoformat(timespec='seconds')
  c.execute("UPDATE positions SET tracking_started_at=? WHERE status='OPEN' AND tracking_started_at IS NULL",(now_iso,))
@@ -315,6 +332,138 @@ def available_paper_margin():
  reserve=max(balance,0.0)*max(float(settings.get('min_free_balance_pct',20.0)),0.0)/100.0
  return max(0.0,balance-used-reserve)
 
+def strategy_lab_create(position_id):
+ def write(c):
+  pos=c.execute('SELECT * FROM positions WHERE id=?',(position_id,)).fetchone()
+  if not pos:
+   return
+  now=datetime.now().isoformat(timespec='seconds')
+  cur=c.execute('''INSERT OR IGNORE INTO strategy_lab_experiments(
+   source_position_id,symbol,side,entry,initial_stop,qty,score,opened_at,created_at
+   ) VALUES(?,?,?,?,?,?,?,?,?)''',(pos['id'],pos['symbol'],pos['side'],pos['entry'],pos['initial_stop'],pos['qty'],pos['score'],pos['opened_at'],now))
+  experiment=c.execute('SELECT id FROM strategy_lab_experiments WHERE source_position_id=?',(position_id,)).fetchone()
+  if not experiment:
+   return
+  fee_rate=max(float(settings.get('paper_fee_rate',0.0008) or 0),0.0)
+  entry_fee=float(pos['entry'])*float(pos['qty'])*fee_rate
+  for model in STRATEGY_LAB_MODELS:
+   c.execute('''INSERT OR IGNORE INTO strategy_lab_runs(
+    experiment_id,model,model_version,status,entry,stop,qty,remaining_qty,realized_pnl,fee_paid,updated_at
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,?)''',(experiment['id'],model,STRATEGY_LAB_VERSION,'OPEN',pos['entry'],pos['initial_stop'],pos['qty'],pos['qty'],-entry_fee,entry_fee,now))
+ _sqlite_write_with_retry(write)
+
+def _strategy_lab_close(c,run,price,reason,now):
+ sign=1 if run['side']=='LONG' else -1
+ rem=float(run['remaining_qty'] or 0)
+ realized=float(run['realized_pnl'] or 0)+(price-float(run['entry']))*sign*rem
+ fee=float(run['fee_paid'] or 0)+price*rem*max(float(settings.get('paper_fee_rate',0.0008) or 0),0.0)
+ realized-=price*rem*max(float(settings.get('paper_fee_rate',0.0008) or 0),0.0)
+ c.execute('''UPDATE strategy_lab_runs SET status='CLOSED',remaining_qty=0,realized_pnl=?,fee_paid=?,
+  closed_at=?,close_price=?,close_reason=?,updated_at=? WHERE id=? AND status='OPEN' ''',
+  (realized,fee,now,price,reason,now,run['id']))
+
+def _strategy_lab_manage_once(c):
+ rows=c.execute('''SELECT r.*,e.source_position_id,e.symbol,e.side,e.initial_stop,e.current_stopped_at,
+  p.status AS source_status,p.remaining_qty AS source_remaining_qty,p.pnl AS source_pnl,
+  p.fee_paid AS source_fee_paid,p.tp1_done AS source_tp1_done,p.tp2_done AS source_tp2_done,
+  p.closed_at AS source_closed_at,p.close_price AS source_close_price,p.close_reason AS source_close_reason,
+  p.mae_r AS source_mae_r,p.mfe_r AS source_mfe_r,p.stop AS source_stop
+  FROM strategy_lab_runs r JOIN strategy_lab_experiments e ON e.id=r.experiment_id
+  JOIN positions p ON p.id=e.source_position_id WHERE r.status='OPEN'
+  ORDER BY r.experiment_id,CASE r.model WHEN 'CURRENT' THEN 0 ELSE 1 END,r.id''').fetchall()
+ now_dt=datetime.now(); now=now_dt.isoformat(timespec='seconds')
+ fee_rate=max(float(settings.get('paper_fee_rate',0.0008) or 0),0.0)
+ for raw in rows:
+  run=dict(raw)
+  price=float((state.get('live_prices') or {}).get(run['symbol']) or (state.get('market',{}).get(run['symbol']) or {}).get('price') or 0)
+  if run['model']=='CURRENT':
+   if run['source_status']=='CLOSED':
+    stopped_at=run['source_closed_at'] if run['source_close_reason']=='STOP' else None
+    if stopped_at:
+     c.execute('UPDATE strategy_lab_experiments SET current_stopped_at=COALESCE(current_stopped_at,?) WHERE id=?',(stopped_at,run['experiment_id']))
+    c.execute('''UPDATE strategy_lab_runs SET status='CLOSED',remaining_qty=?,realized_pnl=?,fee_paid=?,tp1_done=?,tp2_done=?,
+     mae_r=?,mfe_r=?,stop=?,closed_at=?,close_price=?,close_reason=?,updated_at=? WHERE id=?''',
+     (run['source_remaining_qty'],run['source_pnl'],run['source_fee_paid'],run['source_tp1_done'],run['source_tp2_done'],
+      run['source_mae_r'],run['source_mfe_r'],run['source_stop'],run['source_closed_at'],run['source_close_price'],run['source_close_reason'],now,run['id']))
+   else:
+    c.execute('''UPDATE strategy_lab_runs SET remaining_qty=?,realized_pnl=?,fee_paid=?,tp1_done=?,tp2_done=?,
+     mae_r=?,mfe_r=?,stop=?,updated_at=? WHERE id=?''',(run['source_remaining_qty'],run['source_pnl'],run['source_fee_paid'],
+     run['source_tp1_done'],run['source_tp2_done'],run['source_mae_r'],run['source_mfe_r'],run['source_stop'],now,run['id']))
+   continue
+  if price<=0:
+   continue
+  sign=1 if run['side']=='LONG' else -1
+  risk_distance=max(abs(float(run['entry'])-float(run['initial_stop'])),1e-12)
+  progress=(price-float(run['entry']))*sign/risk_distance
+  mae=max(float(run['mae_r'] or 0),max(0.0,-progress)); mfe=max(float(run['mfe_r'] or 0),max(0.0,progress))
+  c.execute('UPDATE strategy_lab_runs SET mae_r=?,mfe_r=?,updated_at=? WHERE id=?',(mae,mfe,now,run['id']))
+  run['mae_r']=mae; run['mfe_r']=mfe
+  if run['source_status']=='CLOSED' and run['source_close_reason']!='STOP':
+   _strategy_lab_close(c,run,price,'CURRENT_'+str(run['source_close_reason'] or 'CLOSE'),now)
+   continue
+  trigger=run['stop_triggered_at']
+  if not trigger:
+   hit_stop=(run['side']=='LONG' and price<=float(run['stop'])) or (run['side']=='SHORT' and price>=float(run['stop']))
+   if hit_stop:
+    trigger=now
+    c.execute('UPDATE strategy_lab_runs SET stop_triggered_at=?,updated_at=? WHERE id=?',(now,now,run['id']))
+    if run['model']=='NO_STOP_MINI':
+     close_qty=float(run['remaining_qty'])*0.85
+     realized=float(run['realized_pnl'])+(price-float(run['entry']))*sign*close_qty-price*close_qty*fee_rate
+     fee=float(run['fee_paid'])+price*close_qty*fee_rate
+     run['remaining_qty']=float(run['remaining_qty'])-close_qty; run['realized_pnl']=realized; run['fee_paid']=fee
+     c.execute('UPDATE strategy_lab_runs SET remaining_qty=?,realized_pnl=?,fee_paid=? WHERE id=?',(run['remaining_qty'],realized,fee,run['id']))
+    else:
+     continue
+   else:
+    rem=float(run['remaining_qty']); realized=float(run['realized_pnl']); fee=float(run['fee_paid'])
+    stop=float(run['stop']); tp1_done=int(run['tp1_done'] or 0); tp2_done=int(run['tp2_done'] or 0)
+    if progress>=float(settings['tp1_r']) and not tp1_done:
+     q=min(float(run['qty'])*float(settings['tp1_pct'])/100.0,rem)
+     realized+=(price-float(run['entry']))*sign*q-price*q*fee_rate; fee+=price*q*fee_rate; rem-=q
+     stop=float(run['entry']); tp1_done=1
+    if progress>=float(settings['tp2_r']) and not tp2_done:
+     q=min(float(run['qty'])*float(settings['tp2_pct'])/100.0,rem)
+     realized+=(price-float(run['entry']))*sign*q-price*q*fee_rate; fee+=price*q*fee_rate; rem-=q
+     stop=float(run['entry'])+sign*risk_distance; tp2_done=1
+    c.execute('''UPDATE strategy_lab_runs SET remaining_qty=?,realized_pnl=?,fee_paid=?,stop=?,
+     tp1_done=?,tp2_done=?,updated_at=? WHERE id=?''',(rem,realized,fee,stop,tp1_done,tp2_done,now,run['id']))
+    continue
+  trigger_dt=_parse_iso(trigger)
+  elapsed=(now_dt-trigger_dt).total_seconds() if trigger_dt else 0
+  total=float(run['realized_pnl'])+(price-float(run['entry']))*sign*float(run['remaining_qty'])
+  current_stopped_at=run['current_stopped_at']
+  if not current_stopped_at:
+   exp=c.execute('SELECT current_stopped_at FROM strategy_lab_experiments WHERE id=?',(run['experiment_id'],)).fetchone()
+   current_stopped_at=exp['current_stopped_at'] if exp else None
+  if current_stopped_at and total>0 and not run['first_post_stop_profit_at']:
+   c.execute('UPDATE strategy_lab_runs SET first_post_stop_profit_at=? WHERE id=?',(now,run['id']))
+   run['first_post_stop_profit_at']=now
+  if total>0:
+   _strategy_lab_close(c,run,price,'RECOVERED_PROFIT',now)
+  elif run['model']=='NO_STOP_MINI' and progress<=-2.0:
+   _strategy_lab_close(c,run,price,'HARD_STOP_2R',now)
+  elif run['model']=='SMART_EXIT' and progress<=-1.5:
+   _strategy_lab_close(c,run,price,'HARD_STOP_1_5R',now)
+  elif run['model']=='SMART_EXIT' and elapsed>=900:
+   _strategy_lab_close(c,run,price,'STOP_CONFIRMED_15M',now)
+  elif elapsed>=7200:
+   _strategy_lab_close(c,run,price,'TIMEOUT_2H',now)
+
+def manage_strategy_lab():
+ try:
+  _sqlite_write_with_retry(_strategy_lab_manage_once)
+  state['strategy_lab_error']=None
+ except Exception as e:
+  state['strategy_lab_error']=f'{type(e).__name__}: {e}'
+
+def strategy_lab_open_symbols():
+ c=db()
+ rows=c.execute('''SELECT DISTINCT e.symbol FROM strategy_lab_runs r
+  JOIN strategy_lab_experiments e ON e.id=r.experiment_id WHERE r.status='OPEN' ''').fetchall()
+ c.close()
+ return [r['symbol'] for r in rows]
+
 def has_open(sym):
  c=db(); r=c.execute("SELECT 1 FROM positions WHERE status='OPEN' AND symbol=?",(sym,)).fetchone(); c.close(); return bool(r)
 def paper_open(sym,side,m,sc):
@@ -346,8 +495,14 @@ def paper_open(sym,side,m,sc):
  entry_fee=p*qty*fee_rate
  opened=datetime.now().isoformat(timespec='seconds')
  def write(c):
-  c.execute('''INSERT INTO positions(symbol,side,status,entry,stop,initial_stop,qty,remaining_qty,risk_usd,score,opened_at,pnl,fee_paid,mae_r,mfe_r,tracking_started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(sym,side,'OPEN',p,stop,stop,qty,qty,actual,sc,opened,-entry_fee,entry_fee,0.0,0.0,opened))
- _sqlite_write_with_retry(write)
+  cur=c.execute('''INSERT INTO positions(symbol,side,status,entry,stop,initial_stop,qty,remaining_qty,risk_usd,score,opened_at,pnl,fee_paid,mae_r,mfe_r,tracking_started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(sym,side,'OPEN',p,stop,stop,qty,qty,actual,sc,opened,-entry_fee,entry_fee,0.0,0.0,opened))
+  return cur.lastrowid
+ position_id=_sqlite_write_with_retry(write)
+ try:
+  strategy_lab_create(position_id)
+ except Exception as e:
+  state['strategy_lab_error']=f'{type(e).__name__}: {e}'
+  log(f'Strategy Lab deney oluşturma hatası: {type(e).__name__}','WARN')
  log(f'{sym} {side} PAPER açıldı | risk ${actual:.2f} | margin ${required_margin:.2f} | giriş fee ${entry_fee:.4f} | skor {sc}')
 def _manage_once(c):
  events=[]
@@ -738,6 +893,7 @@ async def scan_once(force_universe=False):
       paper_open(sym,m['signal'],m,max(m['long_score'],m['short_score']))
 
    manage()
+   manage_strategy_lab()
    state['last_scan']=datetime.now().isoformat(timespec='seconds')
   finally:
    state['scan_duration_sec']=round(time.monotonic()-started,2)
@@ -771,6 +927,7 @@ async def position_engine():
     c=db()
     open_syms=[x['symbol'] for x in c.execute("SELECT DISTINCT symbol FROM positions WHERE status='OPEN'").fetchall()]
     c.close()
+    open_syms=list(dict.fromkeys(open_syms+strategy_lab_open_symbols()))
     if open_syms:
      async with httpx.AsyncClient(
       headers={'User-Agent':'MEXC-Futures-Paper-Trader/2.0'},
@@ -784,6 +941,7 @@ async def position_engine():
         state['market'][sym]['price']=all_prices[sym]
      state['last_price_update']=datetime.now().isoformat(timespec='seconds')
      manage()
+     manage_strategy_lab()
    except Exception as e:
     # Fast price-loop errors should not stop the heavy scanner.
     state['error']=f'Hızlı pozisyon takibi: {e}'
@@ -908,6 +1066,48 @@ def history(period: str='all'):
  rows=history_rows(period)
  pnl=sum(float(x.get('pnl') or 0) for x in rows); wins=sum(float(x.get('pnl') or 0)>0 for x in rows); losses=sum(float(x.get('pnl') or 0)<0 for x in rows)
  return {'rows':rows,'summary':{'pnl':pnl,'trades':len(rows),'wins':wins,'losses':losses,'win_rate':wins/len(rows)*100 if rows else 0}}
+
+@app.get('/api/strategy-lab')
+def strategy_lab():
+ c=db()
+ experiments=[dict(x) for x in c.execute('''SELECT * FROM strategy_lab_experiments
+  ORDER BY id DESC LIMIT 200''').fetchall()]
+ runs=[dict(x) for x in c.execute('''SELECT r.*,e.symbol,e.side,e.current_stopped_at
+  FROM strategy_lab_runs r JOIN strategy_lab_experiments e ON e.id=r.experiment_id
+  ORDER BY r.experiment_id DESC,r.id''').fetchall()]
+ c.close()
+ by_experiment={x['id']:{**x,'models':{}} for x in experiments}
+ model_rows={name:[] for name in STRATEGY_LAB_MODELS}
+ for run in runs:
+  price=float((state.get('live_prices') or {}).get(run['symbol']) or (state.get('market',{}).get(run['symbol']) or {}).get('price') or run.get('close_price') or run['entry'])
+  sign=1 if run['side']=='LONG' else -1
+  run['net_pnl']=float(run['realized_pnl'] or 0)+(price-float(run['entry']))*sign*float(run['remaining_qty'] or 0)
+  run['current_price']=price
+  model_rows.setdefault(run['model'],[]).append(run)
+  if run['experiment_id'] in by_experiment:
+   by_experiment[run['experiment_id']]['models'][run['model']]=run
+ summaries={}
+ current_stop_total=sum(1 for x in experiments if x.get('current_stopped_at'))
+ for model in STRATEGY_LAB_MODELS:
+  items=model_rows.get(model,[]); closed=[x for x in items if x['status']=='CLOSED']
+  wins=[x for x in closed if x['net_pnl']>0]; losses=[x for x in closed if x['net_pnl']<0]
+  gross_profit=sum(x['net_pnl'] for x in wins); gross_loss=abs(sum(x['net_pnl'] for x in losses))
+  recovered=sum(1 for x in items if x.get('first_post_stop_profit_at'))
+  recovered_closed=sum(1 for x in closed if x.get('first_post_stop_profit_at') and x['net_pnl']>0)
+  summaries[model]={
+   'trades':len(items),'open':len(items)-len(closed),'closed':len(closed),
+   'net_pnl':sum(x['net_pnl'] for x in items),'wins':len(wins),'losses':len(losses),
+   'win_rate':len(wins)/len(closed)*100 if closed else 0,
+   'profit_factor':gross_profit/gross_loss if gross_loss else (gross_profit if gross_profit else 0),
+   'avg_pnl':sum(x['net_pnl'] for x in closed)/len(closed) if closed else 0,
+   'avg_mae_r':sum(float(x['mae_r'] or 0) for x in items)/len(items) if items else 0,
+   'avg_mfe_r':sum(float(x['mfe_r'] or 0) for x in items)/len(items) if items else 0,
+   'current_stop_total':current_stop_total,'recovered_after_current_stop':recovered,
+   'recovered_after_current_stop_pct':recovered/current_stop_total*100 if current_stop_total else 0,
+   'profitable_close_after_current_stop':recovered_closed,
+  }
+ return {'model_version':STRATEGY_LAB_VERSION,'error':state.get('strategy_lab_error'),
+  'current_stop_total':current_stop_total,'models':summaries,'experiments':list(by_experiment.values())}
 
 @app.get('/api/stop-analysis')
 def stop_analysis():
