@@ -1,5 +1,5 @@
 from typing import Optional
-import asyncio, json, sqlite3, subprocess, hmac, hashlib, time
+import asyncio, json, sqlite3, subprocess, hmac, hashlib, random, time
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlencode
@@ -119,18 +119,58 @@ mexc_request_lock=asyncio.Lock()
 mexc_last_request_at=0.0
 MEXC_MIN_REQUEST_INTERVAL=0.16
 MEXC_RETRY_DELAYS=(1.0,2.0,4.0,8.0)
+MEXC_TRANSIENT_RETRY_DELAYS=(0.5,1.0,2.0)
+MEXC_RETRY_JITTER_MAX=0.15
+SQLITE_LOCK_RETRY_DELAYS=(0.05,0.1,0.2)
+
+def _is_transient_sqlite_lock(error):
+ msg=str(error).lower()
+ return any(x in msg for x in ('database is locked','database table is locked','database schema is locked'))
+
+def _sqlite_write_with_retry(operation):
+ for attempt in range(len(SQLITE_LOCK_RETRY_DELAYS)+1):
+  c=None
+  try:
+   c=db()
+   result=operation(c)
+   c.commit()
+   return result
+  except sqlite3.OperationalError as e:
+   if c:
+    try: c.rollback()
+    except: pass
+   if not _is_transient_sqlite_lock(e) or attempt>=len(SQLITE_LOCK_RETRY_DELAYS):
+    raise
+   time.sleep(SQLITE_LOCK_RETRY_DELAYS[attempt])
+  finally:
+   if c:
+    try: c.close()
+    except: pass
 
 async def mexc_get(client,url,**kwargs):
  global mexc_last_request_at
  last_response=None
- for attempt in range(len(MEXC_RETRY_DELAYS)+1):
-  async with mexc_request_lock:
-   now=time.monotonic()
-   wait=MEXC_MIN_REQUEST_INTERVAL-(now-mexc_last_request_at)
-   if wait>0:
-    await asyncio.sleep(wait)
-   response=await client.get(url,**kwargs)
-   mexc_last_request_at=time.monotonic()
+ rate_limit_attempt=0
+ transient_attempt=0
+ while True:
+  try:
+   async with mexc_request_lock:
+    now=time.monotonic()
+    wait=MEXC_MIN_REQUEST_INTERVAL-(now-mexc_last_request_at)
+    if wait>0:
+     await asyncio.sleep(wait)
+    response=await client.get(url,**kwargs)
+    mexc_last_request_at=time.monotonic()
+  except (httpx.ConnectTimeout,httpx.ConnectError) as e:
+   if transient_attempt>=len(MEXC_TRANSIENT_RETRY_DELAYS):
+    state['rate_limit_wait']=None
+    raise
+   delay=MEXC_TRANSIENT_RETRY_DELAYS[transient_attempt]+random.uniform(0,MEXC_RETRY_JITTER_MAX)
+   transient_attempt+=1
+   state['rate_limit_wait']=delay
+   log(f'MEXC geçici bağlantı hatası ({type(e).__name__}) · {delay:.2f} sn sonra tekrar','WARN')
+   await asyncio.sleep(delay)
+   continue
   last_response=response
 
   rate_limited=response.status_code==429
@@ -145,16 +185,24 @@ async def mexc_get(client,url,**kwargs):
     pass
 
   if not rate_limited:
+   if 500<=response.status_code<=599 and transient_attempt<len(MEXC_TRANSIENT_RETRY_DELAYS):
+    delay=MEXC_TRANSIENT_RETRY_DELAYS[transient_attempt]+random.uniform(0,MEXC_RETRY_JITTER_MAX)
+    transient_attempt+=1
+    state['rate_limit_wait']=delay
+    log(f'MEXC HTTP {response.status_code} · {delay:.2f} sn sonra tekrar','WARN')
+    await asyncio.sleep(delay)
+    continue
    state['rate_limit_wait']=None
    return response
 
-  if attempt>=len(MEXC_RETRY_DELAYS):
+  if rate_limit_attempt>=len(MEXC_RETRY_DELAYS):
    state['rate_limit_wait']=None
    return response
 
-  delay=MEXC_RETRY_DELAYS[attempt]
+  delay=MEXC_RETRY_DELAYS[rate_limit_attempt]+random.uniform(0,MEXC_RETRY_JITTER_MAX)
+  rate_limit_attempt+=1
   state['rate_limit_wait']=delay
-  log(f'MEXC rate limit · {delay:.0f} sn bekleyip tekrar deneniyor','WARN')
+  log(f'MEXC rate limit · {delay:.2f} sn bekleyip tekrar deneniyor','WARN')
   await asyncio.sleep(delay)
 
  state['rate_limit_wait']=None
@@ -262,15 +310,13 @@ def paper_open(sym,side,m,sc):
   return
  fee_rate=max(float(settings.get('paper_fee_rate',0.0008) or 0),0.0)
  entry_fee=p*qty*fee_rate
- c=db()
  opened=datetime.now().isoformat(timespec='seconds')
- c.execute('''INSERT INTO positions(symbol,side,status,entry,stop,initial_stop,qty,remaining_qty,risk_usd,score,opened_at,pnl,fee_paid,mae_r,mfe_r,tracking_started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(sym,side,'OPEN',p,stop,stop,qty,qty,actual,sc,opened,-entry_fee,entry_fee,0.0,0.0,opened))
- c.commit()
- c.close()
+ def write(c):
+  c.execute('''INSERT INTO positions(symbol,side,status,entry,stop,initial_stop,qty,remaining_qty,risk_usd,score,opened_at,pnl,fee_paid,mae_r,mfe_r,tracking_started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(sym,side,'OPEN',p,stop,stop,qty,qty,actual,sc,opened,-entry_fee,entry_fee,0.0,0.0,opened))
+ _sqlite_write_with_retry(write)
  log(f'{sym} {side} PAPER açıldı | risk ${actual:.2f} | margin ${required_margin:.2f} | giriş fee ${entry_fee:.4f} | skor {sc}')
-def manage():
+def _manage_once(c):
  events=[]
- c=db()
  rows=c.execute("SELECT * FROM positions WHERE status='OPEN'").fetchall()
  for pos in rows:
   md=state.get('market',{}).get(pos['symbol']) or {}
@@ -319,8 +365,10 @@ def manage():
     (rem,pnl,pos['entry']+sign*R,fee_paid,pos['id'])
    )
    events.append((f"{pos['symbol']} TP2",'TRADE'))
- c.commit()
- c.close()
+ return events
+
+def manage():
+ events=_sqlite_write_with_retry(_manage_once)
  for message,level in events:
   log(message,level)
 
