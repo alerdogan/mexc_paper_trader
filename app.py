@@ -547,6 +547,11 @@ def history_rows(period='all'):
  for d in rows:
   if d.get('close_price') is None:
    d['close_price']=d.get('entry')
+  leverage=max(float(settings.get('leverage',1) or 1),1.0)
+  position_notional=float(d.get('entry') or 0)*float(d.get('qty') or 0)
+  d['position_notional_usd']=position_notional
+  d['margin_usd']=position_notional/leverage
+  d['leverage_used']=leverage
  return rows
 
 async def historical_15m(client,symbol,start_dt,end_dt):

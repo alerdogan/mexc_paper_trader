@@ -20,6 +20,28 @@ def row(module, position_id):
     return dict(result)
 
 
+def test_history_includes_initial_position_size_and_margin(
+    isolated_app, insert_position
+):
+    module, _ = isolated_app
+    module.settings["leverage"] = 5
+    position_id = insert_position(
+        status="CLOSED",
+        entry=125.0,
+        qty=8.0,
+        remaining_qty=0.0,
+        closed_at="2026-01-02T00:00:00",
+    )
+
+    history_row = next(
+        item for item in module.history_rows("all") if item["id"] == position_id
+    )
+
+    assert history_row["position_notional_usd"] == 1000.0
+    assert history_row["margin_usd"] == 200.0
+    assert history_row["leverage_used"] == 5.0
+
+
 def trade_logs(module):
     connection = module.db()
     count = connection.execute(
