@@ -12,6 +12,24 @@ from pydantic import BaseModel
 BASE=Path(__file__).parent; DB=BASE/'trader.db'; app=FastAPI(title='MEXC Futures Paper Trader'); templates=Jinja2Templates(directory=str(BASE/'templates'))
 DEFAULTS={"symbols":["BTC_USDT"],"top_volume_count":30,"universe_refresh_minutes":15,"paper_balance":4000.0,"risk_per_trade_usd":20.0,"max_alt_notional_usd":5000.0,"max_btc_notional_usd":10000.0,"max_total_open_risk_usd":100.0,"daily_loss_limit_usd":300.0,"leverage":2,"signal_threshold":80,"scan_seconds":30,"stop_atr_mult":1.5,"tp1_r":1.0,"tp1_pct":30.0,"tp2_r":2.0,"tp2_pct":30.0,"runner_pct":40.0,"move_be_at_r":1.0,"min_free_balance_pct":20.0,"paper_fee_rate":0.0008}
 settings=DEFAULTS.copy(); state={"running":False,"panic":False,"last_scan":None,"market":{},"live_prices":{},"last_price_update":None,"scanning":False,"error":None,"feed":"MEXC FUTURES","public_api":None,"api_saved":False,"private_api":None,"paper_test_threshold":None,"universe":[],"universe_updated":None,"scan_duration_sec":None,"rate_limit_wait":None}
+TASK_NAMES=('scanner','position_engine','ghost_analyzer')
+SUPERVISOR_BACKOFF=(1,2,5,10,30)
+background_tasks={}
+
+def _new_task_status():
+ return {'alive':False,'running':False,'last_success':None,'last_error':None,'restart_count':0,'consecutive_failures':0,'restart_delay_seconds':None}
+
+task_status={name:_new_task_status() for name in TASK_NAMES}
+
+def _task_success(name):
+ info=task_status[name]
+ info['last_success']=datetime.now().isoformat(timespec='seconds')
+ info['consecutive_failures']=0
+ info['restart_delay_seconds']=None
+
+def _task_error(name,error):
+ info=task_status[name]
+ info['last_error']={'type':type(error).__name__,'at':datetime.now().isoformat(timespec='seconds')}
 
 def db():
  c=sqlite3.connect(DB,timeout=30)
@@ -748,12 +766,16 @@ async def position_engine():
    except Exception as e:
     # Fast price-loop errors should not stop the heavy scanner.
     state['error']=f'Hızlı pozisyon takibi: {e}'
+    _task_error('position_engine',e)
+   else:
+    _task_success('position_engine')
   await asyncio.sleep(3)
 
 async def engine():
  while True:
   if state['running'] and not state['panic']:
    await scan_once()
+  _task_success('scanner')
   await asyncio.sleep(max(5,int(settings['scan_seconds'])))
 
 async def ghost_analysis_engine():
@@ -761,20 +783,85 @@ async def ghost_analysis_engine():
  while True:
   try:
    await run_stop_backfill(limit=40,only_pending=True)
+   _task_success('ghost_analyzer')
   except Exception as e:
+   _task_error('ghost_analyzer',e)
    log(f'Ghost analiz motoru: {e}','WARN')
   await asyncio.sleep(300)
+
+async def supervise_task(name,runner):
+ info=task_status[name]
+ while True:
+  info['alive']=True
+  info['running']=True
+  info['restart_delay_seconds']=None
+  try:
+   await runner()
+   raise RuntimeError('Background task unexpectedly returned')
+  except asyncio.CancelledError:
+   info['alive']=False
+   info['running']=False
+   info['restart_delay_seconds']=None
+   raise
+  except Exception as e:
+   info['running']=False
+   info['restart_count']+=1
+   info['consecutive_failures']+=1
+   _task_error(name,e)
+   delay=SUPERVISOR_BACKOFF[min(info['consecutive_failures']-1,len(SUPERVISOR_BACKOFF)-1)]
+   info['restart_delay_seconds']=delay
+   try: log(f'{name} task durdu ({type(e).__name__}) · {delay} sn sonra yeniden başlatılacak','ERROR')
+   except Exception: pass
+   await asyncio.sleep(delay)
+
+def start_background_tasks():
+ runners={'scanner':engine,'position_engine':position_engine,'ghost_analyzer':ghost_analysis_engine}
+ for name,runner in runners.items():
+  current=background_tasks.get(name)
+  if current and not current.done():
+   continue
+  task_status[name]=_new_task_status()
+  background_tasks[name]=asyncio.create_task(supervise_task(name,runner),name=f'{name}-supervisor')
 
 @app.on_event('startup')
 async def startup():
  init_db()
- asyncio.create_task(engine())
- asyncio.create_task(position_engine())
- asyncio.create_task(ghost_analysis_engine())
+ start_background_tasks()
 
 @app.get('/',response_class=HTMLResponse)
 async def home(request: Request):
     return templates.TemplateResponse(request=request, name='index.html')
+@app.get('/api/health')
+def health():
+ database_ok=False
+ c=None
+ try:
+  c=db()
+  c.execute('SELECT 1').fetchone()
+  database_ok=True
+ except Exception:
+  database_ok=False
+ finally:
+  if c:
+   try: c.close()
+   except: pass
+ tasks={}
+ for name in TASK_NAMES:
+  info=dict(task_status[name])
+  task=background_tasks.get(name)
+  info['alive']=bool(task and not task.done() and info['alive'])
+  tasks[name]=info
+ timestamps=[x for x in (state.get('last_price_update'),state.get('last_scan')) if x]
+ all_alive=all(x['alive'] for x in tasks.values())
+ return {
+  'service_status':'healthy' if database_ok and all_alive else 'degraded',
+  'mode':'PAPER',
+  'scanner':tasks['scanner'],
+  'position_engine':tasks['position_engine'],
+  'ghost_analyzer':tasks['ghost_analyzer'],
+  'last_successful_market_data_timestamp':max(timestamps) if timestamps else None,
+  'database_connectivity':database_ok,
+ }
 @app.get('/api/status')
 def status():
  c=db(); raw_pos=c.execute("SELECT * FROM positions WHERE status='OPEN' ORDER BY id DESC").fetchall(); logs=[dict(x) for x in c.execute('SELECT * FROM logs ORDER BY id DESC LIMIT 80').fetchall()]; c.close()

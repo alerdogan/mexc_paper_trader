@@ -55,6 +55,9 @@ def isolated_app(tmp_path, monkeypatch):
     app.settings.update(copy.deepcopy(app.DEFAULTS))
     app.state.clear()
     app.state.update(copy.deepcopy(INITIAL_STATE))
+    app.background_tasks.clear()
+    for name in app.TASK_NAMES:
+        app.task_status[name] = app._new_task_status()
     app.init_db()
     yield app, test_db
 
