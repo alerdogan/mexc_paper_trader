@@ -1,5 +1,5 @@
 from typing import Optional
-import asyncio, json, sqlite3, subprocess, hmac, hashlib, random, time
+import asyncio, json, sqlite3, subprocess, hmac, hashlib, os, random, sys, time
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlencode
@@ -92,7 +92,7 @@ def init_db():
  c.execute('UPDATE config SET data=? WHERE id=1',(json.dumps(settings),))
  c.commit()
  c.close()
- state['api_saved']=bool(keychain_get('api_key'))
+ state['api_saved']=credentials_available()
 
 def log(msg,level='INFO'):
  for attempt in range(4):
@@ -117,6 +117,21 @@ def keychain_get(account):
 def keychain_set(account,value):
  subprocess.run(['security','delete-generic-password','-s','MEXC Paper Trader','-a',account],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
  if value: subprocess.run(['security','add-generic-password','-U','-s','MEXC Paper Trader','-a',account,'-w',value],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+CREDENTIAL_ENV={'api_key':'MEXC_API_KEY','api_secret':'MEXC_API_SECRET'}
+def credential_get(account):
+ env_name=CREDENTIAL_ENV.get(account)
+ value=os.environ.get(env_name,'').strip() if env_name else ''
+ if value:
+  return value
+ return keychain_get(account) if sys.platform=='darwin' else ''
+def credentials_available():
+ return bool(credential_get('api_key') and credential_get('api_secret'))
+def redact_credentials(value,*credentials):
+ text=str(value)
+ for credential in credentials:
+  if credential:
+   text=text.replace(credential,'[REDACTED]')
+ return text[:300]
 def ema(vals,n):
  if not vals:return 0
  k=2/(n+1); e=vals[0]
@@ -998,23 +1013,26 @@ async def public_test():
 class ApiCfg(BaseModel): api_key:str=''; api_secret:str=''
 @app.post('/api/api-settings')
 def api_settings(a:ApiCfg):
+ if sys.platform!='darwin':
+  raise HTTPException(503,'Linux credential yönetimi yalnız systemd EnvironmentFile üzerinden kullanılabilir.')
  try:
   if a.api_key.strip(): keychain_set('api_key',a.api_key.strip())
   if a.api_secret.strip(): keychain_set('api_secret',a.api_secret.strip())
-  state['api_saved']=bool(keychain_get('api_key')); log('MEXC API bilgileri macOS Keychain içine kaydedildi'); return {'ok':True,'saved':state['api_saved']}
+  state['api_saved']=credentials_available(); log('MEXC API bilgileri macOS Keychain içine kaydedildi'); return {'ok':True,'saved':state['api_saved']}
  except Exception as e: raise HTTPException(500,f'Keychain kayıt hatası: {e}')
 @app.post('/api/private-test')
 async def private_test():
- key=keychain_get('api_key'); secret=keychain_get('api_secret')
- if not key or not secret: raise HTTPException(400,'Önce API Key ve Secret kaydedin.')
+ key=credential_get('api_key'); secret=credential_get('api_secret')
+ if not key or not secret: raise HTTPException(503,'Private API credential yapılandırılmamış; PAPER modu normal çalışmaya devam eder.')
  ts=str(int(time.time()*1000)); path='/api/v1/private/account/assets'; sig=hmac.new(secret.encode(),(key+ts).encode(),hashlib.sha256).hexdigest(); headers={'ApiKey':key,'Request-Time':ts,'Signature':sig,'Content-Type':'application/json'}
  try:
   async with httpx.AsyncClient() as client: r=await mexc_get(client,'https://api.mexc.com'+path,headers=headers,timeout=15)
   j=r.json() if 'json' in r.headers.get('content-type','') else {'message':r.text[:300]}
   if r.status_code==200 and j.get('success') is True: state['private_api']='BAĞLI'; log('MEXC özel API bağlantısı doğrulandı'); return {'ok':True,'message':'API Key/Secret doğrulandı. Hesap bağlantısı başarılı.'}
-  state['private_api']='HATA'; raise HTTPException(400,f"MEXC yanıtı: HTTP {r.status_code} · {j.get('message') or j.get('msg') or j.get('code') or str(j)[:250]}")
+  detail=redact_credentials(j.get('message') or j.get('msg') or j.get('code') or str(j),key,secret)
+  state['private_api']='HATA'; raise HTTPException(400,f"MEXC yanıtı: HTTP {r.status_code} · {detail}")
  except HTTPException: raise
- except Exception as e: state['private_api']='HATA'; raise HTTPException(502,str(e))
+ except Exception as e: state['private_api']='HATA'; raise HTTPException(502,redact_credentials(e,key,secret))
 class Settings(BaseModel):
  paper_balance:float;risk_per_trade_usd:float;top_volume_count:int;universe_refresh_minutes:int;max_alt_notional_usd:float;max_btc_notional_usd:float;max_total_open_risk_usd:float;daily_loss_limit_usd:float;leverage:int;signal_threshold:int;scan_seconds:int;stop_atr_mult:float;tp1_r:float;tp1_pct:float;tp2_r:float;tp2_pct:float;runner_pct:float;move_be_at_r:float
 

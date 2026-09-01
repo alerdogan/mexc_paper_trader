@@ -46,6 +46,12 @@ def forbid_real_network(monkeypatch):
     monkeypatch.setattr(socket.socket, "connect_ex", blocked_network)
 
 
+@pytest.fixture(autouse=True)
+def clear_mexc_environment(monkeypatch):
+    monkeypatch.delenv("MEXC_API_KEY", raising=False)
+    monkeypatch.delenv("MEXC_API_SECRET", raising=False)
+
+
 @pytest.fixture
 def isolated_app(tmp_path, monkeypatch):
     test_db = tmp_path / "test-trader.db"

@@ -14,6 +14,9 @@ backups/
 .env
 .env.*
 !.env.example
+secrets.env
+secrets.env.*
+!secrets.env.example
 *.key
 *.pem
 *.p12
