@@ -1,0 +1,211 @@
+<!doctype html><html lang="tr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MEXC Paper Trader</title>
+<style>
+:root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#eef2ff;background:#08101f}body{margin:0}.wrap{max-width:1450px;margin:auto;padding:18px}.top{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.badge{border-radius:999px;padding:7px 11px;font-weight:800}.paper{background:#133c2e;color:#8ff0bd}button{border:0;border-radius:10px;padding:10px 14px;font-weight:700;cursor:pointer}.go{background:#22c55e}.stop{background:#f59e0b}.panic{background:#ef4444;color:white}.scan{background:#60a5fa}.ghost{background:#24324b;color:#e2e8f0}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:16px 0}.card{background:#111b2e;border:1px solid #26334d;border-radius:14px;padding:15px}.big{font-size:24px;font-weight:800}.muted{color:#94a3b8;font-size:13px}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:9px;border-bottom:1px solid #26334d;text-align:left;white-space:nowrap}section{margin-top:18px}h2{font-size:18px}.coins{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.long{color:#4ade80}.short{color:#fb7185}.wait{color:#fbbf24}.save{background:#a78bfa;margin-top:12px}.detail{margin-top:10px;padding-top:9px;border-top:1px solid #26334d}.detailRow{display:grid;grid-template-columns:1.6fr .55fr .55fr 1fr;gap:6px;padding:3px 0;font-size:11px}.opportunity{border-color:#fbbf24}.thresholdBar,.filters,.nav{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:10px 0 14px}.activeThreshold,.activeFilter,.nav button.active{outline:2px solid #fbbf24}.nav{position:sticky;top:0;z-index:20;background:#08101ff2;padding:10px 0}.page{display:none}.page.active{display:block}form{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}label{font-size:12px;color:#94a3b8}input{width:100%;box-sizing:border-box;margin-top:4px;padding:9px;background:#08101f;color:white;border:1px solid #334155;border-radius:8px}.pos{color:#4ade80}.neg{color:#fb7185}.summaryline{display:flex;gap:16px;flex-wrap:wrap;margin:8px 0 14px}.summaryline span{font-weight:700}
+.controlButtons{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.controlButtons button{transition:transform .12s ease,opacity .12s ease,box-shadow .12s ease,filter .12s ease}
+.controlButtons button.activeControl{box-shadow:0 0 0 3px rgba(255,255,255,.22),0 0 22px rgba(255,255,255,.08);transform:translateY(-1px);filter:saturate(1.25) brightness(1.08)}
+.controlButtons button:disabled{cursor:not-allowed;opacity:.32;filter:grayscale(.55);transform:none;box-shadow:none}
+.statusStrip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:14px 0 4px}
+.statusItem{background:#0d1729;border:1px solid #26334d;border-radius:12px;padding:10px 12px;min-height:50px;display:flex;flex-direction:column;justify-content:center}
+.statusLabel{font-size:11px;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em;font-weight:800}
+.statusValue{font-size:14px;font-weight:900;margin-top:4px}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px;background:#64748b;box-shadow:0 0 0 3px rgba(100,116,139,.12)}
+.dot.ok{background:#22c55e;box-shadow:0 0 0 3px rgba(34,197,94,.14)}
+.dot.warn{background:#f59e0b;box-shadow:0 0 0 3px rgba(245,158,11,.14)}
+.dot.bad{background:#ef4444;box-shadow:0 0 0 3px rgba(239,68,68,.14)}
+.dot.busy{background:#60a5fa;box-shadow:0 0 0 3px rgba(96,165,250,.14)}
+.stateOk{color:#86efac}.stateWarn{color:#fcd34d}.stateBad{color:#fca5a5}.stateBusy{color:#93c5fd}
+@media(max-width:1000px){.grid,.coins,form{grid-template-columns:1fr 1fr}.statusStrip{grid-template-columns:1fr 1fr}}@media(max-width:620px){.grid,.coins,form,.statusStrip{grid-template-columns:1fr}.nav button{flex:1}.controlButtons{width:100%}.controlButtons button{flex:1}}
+
+/* Faz 1.8.2 Compact UI */
+.badge.paper{
+  font-size:50% !important;
+  padding:4px 7px !important;
+  line-height:1.1 !important;
+  vertical-align:middle;
+}
+#positionsPage table{
+  font-size:70%;
+}
+#positionsPage th,
+#positionsPage td{
+  padding:5px 6px !important;
+  white-space:nowrap;
+}
+#positionsPage section.card{
+  padding:14px !important;
+}
+#positionsPage h2{
+  font-size:16px !important;
+}
+#positionsPage .big{
+  font-size:26px !important;
+}
+#positionsPage .summaryline,
+#positionsPage .muted{
+  font-size:12px;
+}
+
+#scannerPage table{
+  font-size:82%;
+}
+#scannerPage th,
+#scannerPage td{
+  padding:7px 8px !important;
+}
+.scanner-detail-row{
+  display:none;
+}
+.scanner-detail-row.open{
+  display:table-row;
+}
+.scanner-detail-box{
+  padding:10px 12px;
+  border-radius:10px;
+  background:rgba(255,255,255,.03);
+  font-size:12px;
+  line-height:1.55;
+}
+.detail-toggle{
+  padding:5px 9px !important;
+  font-size:11px !important;
+  min-width:64px;
+}
+@media (max-width: 1100px){
+  #positionsPage table{font-size:64%;}
+  #positionsPage th,#positionsPage td{padding:4px 5px !important;}
+}
+
+</style></head><body><div class="wrap">
+<div class="top"><div><h1 style="margin:0">MEXC Trader <span class="badge paper">PAPER / SANAL</span></h1><div class="muted">Faz 1.8.3 · Kripto-only Top-30 Futures · Canlı P&L · Manuel pozisyon kapatma · localhost:8071</div></div><div class="controlButtons"><button id="btnStart" class="go" onclick="post('/api/start')">▶ Başlat</button><button id="btnStop" class="stop" onclick="post('/api/stop')">■ Durdur</button><button id="btnScan" class="scan" onclick="post('/api/scan')">↻ Şimdi Tara</button><button id="btnPanic" class="panic" onclick="post('/api/panic')">ACİL DURDUR</button></div></div>
+<div class="statusStrip">
+ <div class="statusItem"><div class="statusLabel">Bot Durumu</div><div id="botStatusTop" class="statusValue"><span class="dot"></span>YÜKLENİYOR</div></div>
+ <div class="statusItem"><div class="statusLabel">MEXC Futures</div><div id="mexcStatusTop" class="statusValue"><span class="dot"></span>TEST EDİLMEDİ</div></div>
+ <div class="statusItem"><div class="statusLabel">Tarama</div><div id="scanStatusTop" class="statusValue"><span class="dot"></span>BEKLİYOR</div></div>
+ <div class="statusItem"><div class="statusLabel">Son Tarama</div><div id="lastScanTop" class="statusValue">Henüz yok</div></div>
+</div>
+<div class="nav"><button class="ghost active" data-page="positionsPage" onclick="showPage('positionsPage',this)">1 · Pozisyonlar</button><button class="ghost" data-page="scannerPage" onclick="showPage('scannerPage',this)">2 · Piyasa Tarayıcı</button><button class="ghost" data-page="opportunitiesPage" onclick="showPage('opportunitiesPage',this)">3 · Yaklaşan Fırsatlar</button><button class="ghost" data-page="settingsPage" onclick="showPage('settingsPage',this)">4 · Ayarlar</button><button class="ghost" data-page="stopAnalyzerPage" onclick="showPage('stopAnalyzerPage',this);loadStopAnalysis()">5 · Stop Analizi</button></div>
+
+<div id="positionsPage" class="page active">
+<div class="grid"><div class="card"><div class="muted">Sanal Kasa</div><div class="big" id="bal">—</div></div><div class="card"><div class="muted">Tahmini Equity</div><div class="big" id="equity">—</div></div><div class="card"><div class="muted">Açık Pozisyon K/Z</div><div class="big" id="unrealized">—</div></div><div class="card"><div class="muted">Açık Risk</div><div class="big" id="risk">—</div><div class="muted" id="availableRisk">Yeni işlem için kullanılabilir risk: —</div></div></div>
+<section class="card"><h2>Aktif PAPER Pozisyonlar</h2><div style="overflow:auto"><table><thead><tr><th>Coin</th><th>Yön</th><th>Skor</th><th>Giriş</th><th>Pozisyon $</th><th>Margin $</th><th>Anlık</th><th>Stop</th><th>Stop %</th><th>TP1 / Kâr Al</th><th>TP2 / Kâr Al</th><th>Risk</th><th>R</th><th>MAE</th><th>MFE</th><th>Gerçekleşen</th><th>Anlık K/Z</th><th>Toplam K/Z</th><th>%</th><th>İşlem</th></tr></thead><tbody id="positions"></tbody></table></div></section>
+<section class="card"><div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap"><h2 style="margin:0">Geçmiş Pozisyonlar</h2><div id="historyTotalBox" class="badge paper" style="font-size:16px;padding:9px 14px">Bugün Toplam K/Z: —</div></div><div class="filters" style="margin-top:12px"><button class="ghost activeFilter" id="fToday" onclick="setHistoryFilter('today',this)">Bugün</button><button class="ghost" onclick="setHistoryFilter('week',this)">Bu Hafta</button><button class="ghost" onclick="setHistoryFilter('month',this)">Bu Ay</button><button class="ghost" onclick="setHistoryFilter('all',this)">Tümü</button></div><div class="summaryline muted" id="historySummary">—</div><div style="overflow:auto"><table><thead><tr><th>#</th><th>Coin</th><th>Yön</th><th>Skor</th><th>Giriş</th><th>Kapanış</th><th>Son Stop</th><th>Fee</th><th>Net K/Z</th><th>Açılış</th><th>Kapanış Zamanı</th></tr></thead><tbody id="historyRows"></tbody></table></div></section>
+</div>
+
+<div id="scannerPage" class="page"><div class="grid"><div class="card"><div class="muted">Motor</div><div class="big" id="motor">—</div></div><div class="card"><div class="muted">Son Tarama</div><div class="big" id="scanTime" style="font-size:16px">—</div></div><div class="card"><div class="muted">Aktif Eşik</div><div class="big" id="thresholdCard">—</div></div><div class="card"><div class="muted">Havuz</div><div class="big" id="universeCard">—</div></div></div>
+<section><h2>Piyasa Tarayıcı <span class="badge paper" id="universeInfo">Top-30</span></h2><div class="thresholdBar"><span class="muted">PAPER test eşiği:</span><button class="ghost" id="thr60" onclick="setTestThreshold(60)">60 / TEST</button><button class="ghost" id="thr70" onclick="setTestThreshold(70)">70 / TEST</button><button class="go" id="thrNormal" onclick="setTestThreshold(null)">Normal ayar</button><span class="badge paper" id="effectiveThreshold">Aktif eşik —</span></div><div class="coins" id="coins"></div></section></div>
+
+<div id="opportunitiesPage" class="page"><section class="card"><h2>Yaklaşan Fırsatlar <span class="muted">(70–79 puan)</span></h2><div class="muted" style="margin-bottom:12px">En yüksek skor üstte. Normal işlem eşiği 80; bu sayfa işlem açmadan önce yaklaşan adayları gösterir.</div><div id="opportunities" class="muted">Henüz tarama yok.</div></section></div>
+
+<div id="stopAnalyzerPage" class="page">
+ <div class="grid">
+  <div class="card"><div class="muted">Analiz Edilen Stop</div><div class="big" id="saTracked">—</div></div>
+  <div class="card"><div class="muted">2 Saati Tamamlanan</div><div class="big" id="saCompleted">—</div></div>
+  <div class="card"><div class="muted">Stop Sonrası +1R</div><div class="big" id="saEarly">—</div><div class="muted" id="saEarlyPct">—</div></div>
+  <div class="card"><div class="muted">Stop Sonrası +2R</div><div class="big" id="saVery">—</div><div class="muted" id="saVeryPct">—</div></div>
+ </div>
+ <section class="card">
+  <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+   <div><h2 style="margin:0">Stop Analyzer</h2><div class="muted" style="margin-top:6px">MAE/MFE yeni işlemlerde canlı izlenir. Eski işlemler 15 dakikalık MEXC mumlarından yaklaşık hesaplanır. Stop sonrası 2 saat boyunca fiyat hayalet olarak takip edilir.</div></div>
+   <button id="btnBackfillStops" class="scan" onclick="backfillStops()">Geçmiş Stopları Analiz Et</button>
+  </div>
+  <div id="stopAnalysisMsg" class="muted" style="margin:12px 0">—</div>
+  <div style="overflow:auto"><table>
+   <thead><tr><th>#</th><th>Coin</th><th>Yön</th><th>Kapanış</th><th>MAE</th><th>MFE</th><th>Stop Sonrası Max</th><th>+1R?</th><th>+2R?</th><th>Yorum</th><th>Kaynak</th><th>Durum</th></tr></thead>
+   <tbody id="stopAnalysisRows"></tbody>
+  </table></div>
+ </section>
+</div>
+
+<div id="settingsPage" class="page"><section class="card"><h2>MEXC Bağlantı / API Ayarları</h2><div class="muted" style="margin-bottom:10px">Piyasa taraması public Futures API ile anahtarsız çalışır. Key/Secret yalnız Mac Keychain'de tutulur; PAPER modunda emir gönderilmez.</div><div class="grid" style="grid-template-columns:repeat(3,1fr)"><div><label>API Key<input id="apiKey" type="password" autocomplete="off" placeholder="API Key"></label></div><div><label>Secret Key<input id="apiSecret" type="password" autocomplete="off" placeholder="Secret Key"></label></div><div><div class="muted">Durum</div><div id="apiState" style="font-weight:800;margin-top:8px">—</div></div></div><button class="save" onclick="saveApi()">API Bilgilerini Mac'e Kaydet</button> <button class="scan" onclick="testPublic()">Futures Veri Bağlantısını Test Et</button> <button class="go" onclick="testPrivate()">API Key'i Test Et</button><div id="apiMsg" class="muted" style="margin-top:10px"></div></section>
+<section class="card"><h2>Parametreler</h2><form id="settings"></form><button class="save" onclick="save()">Ayarları Kaydet</button></section>
+<section><h2>Performans</h2><div class="grid"><div class="card"><div class="muted">Günlük K/Z</div><div class="big" id="pd">—</div><div class="muted" id="pdm">—</div></div><div class="card"><div class="muted">Haftalık K/Z</div><div class="big" id="pw">—</div><div class="muted" id="pwm">—</div></div><div class="card"><div class="muted">Aylık K/Z</div><div class="big" id="pm">—</div><div class="muted" id="pmm">—</div></div><div class="card"><div class="muted">Yıllık K/Z</div><div class="big" id="py">—</div><div class="muted" id="pym">—</div></div></div></section>
+<section class="card"><h2>Sistem Logu</h2><div id="logs" style="font-family:monospace;font-size:12px;max-height:330px;overflow:auto"></div></section></div>
+</div>
+<script>
+const labels={paper_balance:"Sanal kasa ($)",risk_per_trade_usd:"İşlem başı risk ($)",max_alt_notional_usd:"Altcoin max notional ($)",max_btc_notional_usd:"BTC max notional ($)",max_total_open_risk_usd:"Toplam açık risk tavanı ($)",daily_loss_limit_usd:"Günlük zarar limiti ($)",leverage:"Kaldıraç (x)",signal_threshold:"Sinyal eşiği /100",scan_seconds:"Tarama sıklığı (sn)",stop_atr_mult:"Stop ATR katsayısı",tp1_r:"TP1 (R)",tp1_pct:"TP1 realize %",tp2_r:"TP2 (R)",tp2_pct:"TP2 realize %",runner_pct:"Runner %",move_be_at_r:"Stop BE taşıma (R)",top_volume_count:"Hacme göre taranacak coin sayısı",universe_refresh_minutes:"Hacim havuzu yenileme (dk)"};let loaded=false,historyFilter='today';
+function showPage(id,btn){document.querySelectorAll('.page').forEach(x=>x.classList.remove('active'));document.getElementById(id).classList.add('active');document.querySelectorAll('.nav button').forEach(x=>x.classList.remove('active'));btn.classList.add('active')}
+async function post(u,b){let r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:b?JSON.stringify(b):null});let raw=await r.text();let j={};try{j=raw?JSON.parse(raw):{}}catch(e){j={detail:raw}}if(!r.ok){let msg=j.detail||('HTTP '+r.status);if(typeof apiMsg!=='undefined'&&apiMsg)apiMsg.textContent=msg;throw new Error(msg)}await refresh();return j}
+async function saveApi(){try{let j=await post('/api/api-settings',{api_key:apiKey.value,api_secret:apiSecret.value});apiMsg.textContent=j.saved?'API bilgileri macOS Keychain içine kaydedildi.':'Kayıt yapılmadı.';apiKey.value='';apiSecret.value=''}catch(e){}}
+async function testPublic(){try{let r=await fetch('/api/public-test');let j=await r.json();if(!r.ok)throw new Error(j.detail||r.status);apiMsg.textContent=j.message;await refresh()}catch(e){apiMsg.textContent='Futures veri testi HATA: '+e.message}}
+async function testPrivate(){try{let j=await post('/api/private-test');apiMsg.textContent=j.message}catch(e){}}
+async function setTestThreshold(v){try{await post('/api/test-threshold',{threshold:v});await post('/api/scan')}catch(e){}}
+function detailHtml(m){return `<div class="detail"><div class="detailRow muted"><b>Teyit</b><b>LONG</b><b>SHORT</b><b>Durum</b></div>${(m.score_details||[]).map(x=>`<div class="detailRow"><span>${x.name}</span><span class="long">+${x.long}</span><span class="short">+${x.short}</span><span class="muted">${x.note}</span></div>`).join('')}</div>`}
+function fmt(x,n=4){return Number(x||0).toLocaleString('tr-TR',{maximumFractionDigits:n})}function money(x){let n=Number(x||0);return `${n>0?'+':''}$${fmt(n,2)}`}function cls(n){return Number(n)>0?'pos':Number(n)<0?'neg':''}
+async function loadHistory(){let r=await fetch('/api/history?period='+historyFilter),d=await r.json();let historyRows=document.getElementById('historyRows');historyRows.innerHTML=d.rows.map(p=>`<tr><td>${p.id}</td><td>${p.symbol}</td><td class="${p.side==='LONG'?'long':'short'}">${p.side}</td><td>${fmt(p.score,0)}</td><td>${fmt(p.entry,6)}</td><td>${fmt(p.close_price,6)}</td><td>${fmt(p.stop,6)}</td><td><b>$${fmt(p.fee_paid||0,4)}</b></td><td class="${cls(p.pnl)}"><b>${money(p.pnl)}</b></td><td>${p.opened_at||'—'}</td><td>${p.closed_at||'—'}</td></tr>`).join('')||'<tr><td colspan="11" class="muted">Bu dönemde kapanmış işlem yok.</td></tr>';let s=d.summary;historySummary.innerHTML=`<span>${s.trades} işlem</span><span class="${cls(s.pnl)}">K/Z ${money(s.pnl)}</span><span>${s.wins} kazanç / ${s.losses} zarar</span><span>Başarı %${fmt(s.win_rate,1)}</span>`;let periodLabel={today:'Bugün',week:'Bu Hafta',month:'Bu Ay',all:'Tümü'}[historyFilter]||'Toplam';let hb=document.getElementById('historyTotalBox');hb.textContent=`${periodLabel} Toplam K/Z: ${money(s.pnl)}`;hb.className='badge paper '+cls(s.pnl)}
+function setHistoryFilter(v,btn){historyFilter=v;document.querySelectorAll('.filters button').forEach(x=>x.classList.remove('activeFilter'));btn.classList.add('activeFilter');loadHistory()}
+function setTopState(d){
+ const running=!!d.state.running, panic=!!d.state.panic, scanning=!!d.state.scanning;
+ const rateWait=Number(d.state.rate_limit_wait||0);
+ const pub=(d.state.public_api||'TEST EDİLMEDİ').toUpperCase();
+
+ const bStart=document.getElementById('btnStart'),bStop=document.getElementById('btnStop'),bScan=document.getElementById('btnScan'),bPanic=document.getElementById('btnPanic');
+ bStart.disabled=running&&!panic;
+ bStop.disabled=!running||panic;
+ bScan.disabled=scanning||panic;
+ bPanic.disabled=panic;
+ bStart.classList.toggle('activeControl',running&&!panic);
+ bStop.classList.toggle('activeControl',!running&&!panic);
+ bScan.classList.toggle('activeControl',scanning);
+ bPanic.classList.toggle('activeControl',panic);
+
+ let bot=document.getElementById('botStatusTop');
+ if(panic){bot.innerHTML='<span class="dot bad"></span>ACİL DURDURMA AKTİF';bot.className='statusValue stateBad'}
+ else if(scanning&&running){bot.innerHTML='<span class="dot busy"></span>ÇALIŞIYOR · TARANIYOR';bot.className='statusValue stateBusy'}
+ else if(running){bot.innerHTML='<span class="dot ok"></span>MOTOR ÇALIŞIYOR';bot.className='statusValue stateOk'}
+ else{bot.innerHTML='<span class="dot warn"></span>MOTOR DURDU';bot.className='statusValue stateWarn'}
+
+ let mx=document.getElementById('mexcStatusTop');
+ if(pub==='BAĞLI'){mx.innerHTML='<span class="dot ok"></span>BAĞLI';mx.className='statusValue stateOk'}
+ else if(pub==='HATA'){mx.innerHTML='<span class="dot bad"></span>HATA';mx.className='statusValue stateBad'}
+ else{mx.innerHTML='<span class="dot"></span>'+pub;mx.className='statusValue'}
+
+ let sc=document.getElementById('scanStatusTop');
+ if(rateWait>0){sc.innerHTML='<span class="dot warn"></span>MEXC BEKLENİYOR · '+fmt(rateWait,0)+' sn';sc.className='statusValue stateWarn'}
+ else if(scanning){sc.innerHTML='<span class="dot busy"></span>TARANIYOR…';sc.className='statusValue stateBusy'}
+ else if(running){sc.innerHTML='<span class="dot ok"></span>HAZIR / OTOMATİK';sc.className='statusValue stateOk'}
+ else{sc.innerHTML='<span class="dot"></span>BEKLİYOR';sc.className='statusValue'}
+
+ document.getElementById('lastScanTop').textContent=d.state.last_scan||'Henüz yok';
+}
+async function refresh(){let d=await(await fetch('/api/status')).json();setTopState(d);motor.textContent=d.state.panic?'ACİL DURDU':(d.state.scanning?'TARANIYOR…':(d.state.running?'ÇALIŞIYOR':'DURDU'));bal.textContent='$'+fmt(d.portfolio.current_balance,2);equity.textContent='$'+fmt(d.portfolio.equity,2);let ami=document.getElementById('availableMarginInfo');if(ami)ami.textContent=`Kullanılabilir Margin: $${fmt(d.portfolio.available_margin,2)} · Rezerv %${fmt(d.settings.min_free_balance_pct,0)}`;unrealized.textContent=money(d.portfolio.unrealized_pnl+d.portfolio.open_realized_pnl);unrealized.className='big '+cls(d.portfolio.unrealized_pnl+d.portfolio.open_realized_pnl);risk.textContent='$'+fmt(d.open_risk,2)+' / $'+fmt(d.settings.max_total_open_risk_usd,2);availableRisk.textContent=`Yeni işlem için kullanılabilir risk: $${fmt(d.available_open_risk,2)}`;availableRisk.className='muted '+(Number(d.available_open_risk)<=0?'neg':'');scanTime.textContent=d.state.last_scan||'Henüz yok';apiState.textContent='Futures: '+(d.state.public_api||'TEST EDİLMEDİ')+' · Keychain: '+(d.state.api_saved?'KAYITLI':'BOŞ')+' · Özel API: '+(d.state.private_api||'TEST EDİLMEDİ');if(d.state.error)apiMsg.textContent=d.state.error;
+for(const [k,id,mid] of [['daily','pd','pdm'],['weekly','pw','pwm'],['monthly','pm','pmm'],['yearly','py','pym']]){let s=d.period_stats[k],e=document.getElementById(id);e.textContent=money(s.pnl);e.className='big '+cls(s.pnl);document.getElementById(mid).textContent=s.trades+' işlem · '+s.wins+' kazanç / '+s.losses+' zarar · Başarı %'+fmt(s.win_rate,1)}
+effectiveThreshold.textContent='Aktif eşik '+d.effective_threshold;thresholdCard.textContent=d.effective_threshold+'/100';thr60.classList.toggle('activeThreshold',d.state.paper_test_threshold===60);thr70.classList.toggle('activeThreshold',d.state.paper_test_threshold===70);thrNormal.classList.toggle('activeThreshold',!d.state.paper_test_threshold);universeCard.textContent=(d.state.universe||[]).length+' coin';universeInfo.textContent='Hacim Top-'+d.settings.top_volume_count+' · '+(d.state.universe_updated||'henüz yok')+(d.state.scan_duration_sec!=null?' · son tarama '+fmt(d.state.scan_duration_sec,1)+' sn':'')+(d.state.last_price_update?' · hızlı fiyat '+d.state.last_price_update:'');let rankMap={};(d.state.universe||[]).forEach(x=>rankMap[x.symbol]=x.rank);let openSymbols=new Set((d.positions||[]).map(p=>p.symbol));let cs='',ops=[];let marketEntries=Object.entries(d.state.market).sort((a,b)=>Math.max(b[1].long_score,b[1].short_score)-Math.max(a[1].long_score,a[1].short_score));for(const [s,m] of marketEntries){let cl=m.signal==='LONG'?'long':m.signal==='SHORT'?'short':'wait';let nice=s.replace('_USDT','/USDT');cs+=`<div class="card ${m.near_opportunity?'opportunity':''}"><b>#${rankMap[s]||'?'} HACİM · ${nice}</b><div class="big">$${fmt(m.price,6)}</div><div class="${cl}"><b>${m.signal}</b></div><div class="muted">LONG ${m.long_score}/100 · SHORT ${m.short_score}/100<br>RSI ${fmt(m['15m'].rsi,1)} · Hacim ${fmt(m['15m'].volume_ratio,2)}x<br>15m ${m['15m'].trend} · 1h ${m['1h'].trend} · 4h ${m['4h'].trend}</div>${detailHtml(m)}</div>`;if(m.near_opportunity&&!openSymbols.has(s)){let dir=m.long_score>m.short_score?'LONG':'SHORT',sc=Math.max(m.long_score,m.short_score);ops.push({sc,html:`<div class="card opportunity" style="margin:8px 0"><b>${nice}</b> · <span class="${dir==='LONG'?'long':'short'}"><b>${dir} ${sc}/100</b></span> <span class="muted">— normal 80 eşiğine ${80-sc} puan kaldı</span>${detailHtml(m)}</div>`})}}coins.innerHTML=cs||'<div class="muted">Henüz tarama yok.</div>';opportunities.innerHTML=ops.length?ops.sort((a,b)=>b.sc-a.sc).map(x=>x.html).join(''):'Şu anda 70–79 aralığında ve açık pozisyonu olmayan yaklaşan fırsat yok.';
+positions.innerHTML=d.positions.map(p=>`<tr><td>${p.symbol}</td><td class="${p.side==='LONG'?'long':'short'}">${p.side}</td><td>${fmt(p.score,0)}</td><td>${fmt(p.entry,6)}</td><td><b>$${fmt(p.position_notional_usd,2)}</b><div class="muted" style="font-size:11px">ilk $${fmt(p.initial_notional_usd,2)}</div></td><td><b>$${fmt(p.margin_usd,2)}</b><div class="muted" style="font-size:11px">${fmt(p.leverage_used,0)}x · ilk $${fmt(p.initial_margin_usd,2)}</div></td><td>${fmt(p.current_price,6)}</td><td>${fmt(p.stop,6)}</td><td><b>%${fmt(p.stop_pct,2)}</b></td><td class="${p.tp1_done?'pos':''}">${fmt(p.tp1_price,6)}${p.tp1_done?' ✓':''}</td><td class="${p.tp2_done?'pos':''}">${fmt(p.tp2_price,6)}${p.tp2_done?' ✓':''}</td><td>$${fmt(p.risk_usd,2)}</td><td class="${cls(p.r_now)}">${p.r_now>0?'+':''}${fmt(p.r_now,2)}R</td><td class="neg">-${fmt(p.mae_r||0,2)}R</td><td class="pos">+${fmt(p.mfe_r||0,2)}R</td><td class="${cls(p.realized_pnl)}">${money(p.realized_pnl)}</td><td class="${cls(p.unrealized_pnl)}">${money(p.unrealized_pnl)}</td><td class="${cls(p.total_live_pnl)}"><b>${money(p.total_live_pnl)}</b></td><td class="${cls(p.pnl_pct)}">${p.pnl_pct>0?'+':''}${fmt(p.pnl_pct,2)}%</td><td><button class="panic" style="padding:6px 10px" onclick="closePosition(${p.id},'${p.symbol}','${p.side}')">Kapat</button></td></tr>`).join('')||'<tr><td colspan="20" class="muted">Açık pozisyon yok.</td></tr>';
+logs.innerHTML=d.logs.map(x=>`<div>[${x.ts}] ${x.level} — ${x.message}</div>`).join('');if(!loaded){let f='';for(const[k,l]of Object.entries(labels))f+=`<label>${l}<input name="${k}" type="number" step="any" value="${d.settings[k]}"></label>`;settings.innerHTML=f;loaded=true}}
+async function loadStopAnalysis(){
+ try{
+  let r=await fetch('/api/stop-analysis'),d=await r.json(),s=d.summary||{};
+  saTracked.textContent=s.tracked||0;saCompleted.textContent=s.completed||0;
+  saEarly.textContent=s.early_stops||0;saVery.textContent=s.very_early_stops||0;
+  saEarlyPct.textContent='Tamamlananların %'+fmt(s.early_stop_pct||0,1);
+  saVeryPct.textContent='Tamamlananların %'+fmt(s.very_early_stop_pct||0,1);
+  stopAnalysisRows.innerHTML=(d.rows||[]).map(x=>{
+   let comment=x.very_early_stop?'ÇOK MUHTEMEL ERKEN STOP':(x.early_stop?'MUHTEMEL ERKEN STOP':'STOP MAKUL');
+   let cc=x.very_early_stop||x.early_stop?'neg':'pos';
+   return `<tr><td>${x.id}</td><td>${x.symbol}</td><td class="${x.side==='LONG'?'long':'short'}">${x.side}</td><td>${x.closed_at||'—'}</td><td class="neg">-${fmt(x.mae_r||0,2)}R</td><td class="pos">+${fmt(x.mfe_r||0,2)}R</td><td class="pos">+${fmt(x.ghost_max_r||0,2)}R</td><td>${x.ghost_hit_1r?'EVET':'Hayır'}</td><td>${x.ghost_hit_2r?'EVET':'Hayır'}</td><td class="${cc}"><b>${comment}</b></td><td>${x.stop_analysis_source||'—'}</td><td>${x.analysis_status||'—'}</td></tr>`
+  }).join('')||'<tr><td colspan="12" class="muted">Henüz analiz edilmiş stop yok. “Geçmiş Stopları Analiz Et” düğmesine basabilirsin.</td></tr>';
+ }catch(e){stopAnalysisMsg.textContent='Stop analiz verisi alınamadı: '+e.message}
+}
+async function backfillStops(){
+ let b=document.getElementById('btnBackfillStops');b.disabled=true;b.textContent='Analiz ediliyor…';
+ stopAnalysisMsg.textContent='MEXC geçmiş mumları çekiliyor. Rate-limit koruması nedeniyle biraz sürebilir.';
+ try{
+  let r=await fetch('/api/stop-analysis/backfill',{method:'POST'}),j=await r.json();
+  if(!r.ok)throw new Error(j.detail||r.status);
+  stopAnalysisMsg.textContent=`Tamamlandı: ${j.analyzed} stop analiz edildi · ${j.errors} hata.`;
+  await loadStopAnalysis();
+ }catch(e){stopAnalysisMsg.textContent='Analiz hatası: '+e.message}
+ finally{b.disabled=false;b.textContent='Geçmiş Stopları Analiz Et'}
+}
+
+function toggleScannerDetail(id,btn){
+ const row=document.getElementById(id);
+ if(!row)return;
+ const open=row.classList.toggle('open');
+ if(btn)btn.textContent=open?'Kapat':'Detay';
+}
+
+async function closePosition(id,symbol,side){if(!confirm(`${symbol} ${side} PAPER pozisyonunu anlık fiyattan kapatmak istiyor musun?`))return;try{let j=await post(`/api/positions/${id}/close`);alert(`${symbol} kapatıldı. Gerçekleşen K/Z: ${money(j.pnl)}`);await loadHistory();await refresh()}catch(e){alert('Pozisyon kapatılamadı: '+e.message)}}
+async function save(){let o={};new FormData(settings).forEach((v,k)=>o[k]=Number(v));await post('/api/settings',o)}refresh();loadHistory();setInterval(()=>{refresh();if(document.getElementById('positionsPage').classList.contains('active'))loadHistory()},5000);
+</script></body></html>

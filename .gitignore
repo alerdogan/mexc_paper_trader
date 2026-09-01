@@ -1,0 +1,39 @@
+# Python virtual environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Production data and backups
+trader.db
+trader.db-*
+backups/
+
+# Environment and credential material
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.cer
+*.credential
+*.credentials
+*.secret
+credentials/
+credential/
+secrets/
+secret/
+*credentials*.json
+*secrets*.json
+
+# Local tooling and OS metadata
+.DS_Store
+.idea/
+.vscode/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
