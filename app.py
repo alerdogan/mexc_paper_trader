@@ -12,7 +12,7 @@ from pydantic import BaseModel
 BASE=Path(__file__).parent; DB=BASE/'trader.db'; app=FastAPI(title='MEXC Futures Paper Trader'); templates=Jinja2Templates(directory=str(BASE/'templates'))
 SERVICE_STARTED_MONOTONIC=time.monotonic()
 DEFAULTS={"symbols":["BTC_USDT"],"top_volume_count":30,"universe_refresh_minutes":15,"paper_balance":4000.0,"risk_per_trade_usd":20.0,"max_alt_notional_usd":5000.0,"max_btc_notional_usd":10000.0,"max_total_open_risk_usd":100.0,"daily_loss_limit_usd":300.0,"leverage":2,"signal_threshold":80,"scan_seconds":30,"stop_atr_mult":1.5,"tp1_r":1.0,"tp1_pct":30.0,"tp2_r":2.0,"tp2_pct":30.0,"runner_pct":40.0,"move_be_at_r":1.0,"min_free_balance_pct":20.0,"paper_fee_rate":0.0008}
-settings=DEFAULTS.copy(); state={"running":False,"panic":False,"last_scan":None,"market":{},"live_prices":{},"last_price_update":None,"scanning":False,"error":None,"feed":"MEXC FUTURES","public_api":None,"api_saved":False,"private_api":None,"paper_test_threshold":None,"universe":[],"universe_updated":None,"scan_duration_sec":None,"rate_limit_wait":None}
+settings=DEFAULTS.copy(); state={"running":False,"panic":False,"entry_paused":False,"last_scan":None,"market":{},"live_prices":{},"last_price_update":None,"scanning":False,"error":None,"feed":"MEXC FUTURES","public_api":None,"api_saved":False,"private_api":None,"paper_test_threshold":None,"universe":[],"universe_updated":None,"scan_duration_sec":None,"rate_limit_wait":None}
 TASK_NAMES=('scanner','position_engine','ghost_analyzer')
 STRATEGY_LAB_MODELS=('CURRENT','NO_STOP_MINI','SMART_EXIT')
 STRATEGY_LAB_VERSION='1.0'
@@ -388,6 +388,8 @@ def _strategy_lab_manage_once(c):
  for raw in rows:
   run=dict(raw)
   price=float((state.get('live_prices') or {}).get(run['symbol']) or (state.get('market',{}).get(run['symbol']) or {}).get('price') or 0)
+  if run['model']=='CURRENT' and run['source_status']=='CLOSED' and run['source_close_reason']=='EMERGENCY_CLOSE':
+   continue
   if run['model']=='CURRENT':
    if run['source_status']=='CLOSED':
     stopped_at=run['source_closed_at'] if run['source_close_reason']=='STOP' else None
@@ -410,7 +412,7 @@ def _strategy_lab_manage_once(c):
   mae=max(float(run['mae_r'] or 0),max(0.0,-progress)); mfe=max(float(run['mfe_r'] or 0),max(0.0,progress))
   c.execute('UPDATE strategy_lab_runs SET mae_r=?,mfe_r=?,updated_at=? WHERE id=?',(mae,mfe,now,run['id']))
   run['mae_r']=mae; run['mfe_r']=mfe
-  if run['source_status']=='CLOSED' and run['source_close_reason']!='STOP':
+  if run['source_status']=='CLOSED' and run['source_close_reason'] not in ('STOP','EMERGENCY_CLOSE'):
    _strategy_lab_close(c,run,price,'CURRENT_'+str(run['source_close_reason'] or 'CLOSE'),now)
    continue
   trigger=run['stop_triggered_at']
@@ -517,6 +519,8 @@ def _insert_score_snapshot(c,position_id,snapshot):
 def has_open(sym):
  c=db(); r=c.execute("SELECT 1 FROM positions WHERE status='OPEN' AND symbol=?",(sym,)).fetchone(); c.close(); return bool(r)
 def paper_open(sym,side,m,sc):
+ if state.get('entry_paused'):
+  return
  if has_open(sym):
   return
  if period_stats()['daily']['pnl']<=-settings['daily_loss_limit_usd']:
@@ -974,7 +978,8 @@ async def fetch_futures_prices(client):
 async def position_engine():
  # Lightweight loop: one ticker request, then TP1/TP2/Stop checks.
  while True:
-  if state['running'] and not state['panic']:
+  # Bot stop pauses new scans/entries, but existing PAPER positions keep TP/SL protection.
+  if not state['panic']:
    try:
     c=db()
     open_syms=[x['symbol'] for x in c.execute("SELECT DISTINCT symbol FROM positions WHERE status='OPEN'").fetchall()]
@@ -1182,6 +1187,84 @@ async def stop_analysis_backfill():
  log(f"Stop Analyzer geriye dönük tarama tamamlandı · {result['analyzed']} işlem · {result['errors']} hata")
  return {'ok':True,**result}
 
+class BulkCloseRequest(BaseModel):
+ position_ids:list[int]
+
+@app.get('/api/positions/open-summary')
+def open_positions_summary():
+ c=db()
+ rows=[dict(x) for x in c.execute("SELECT id,symbol,side FROM positions WHERE status='OPEN' ORDER BY id").fetchall()]
+ c.close()
+ return {'count':len(rows),'positions':rows}
+
+async def bulk_market_prices(symbols):
+ async with httpx.AsyncClient(
+  headers={'User-Agent':'MEXC-Futures-Paper-Trader/2.0'},
+  limits=httpx.Limits(max_connections=4,max_keepalive_connections=4)
+ ) as client:
+  all_prices=await fetch_futures_prices(client)
+ return {symbol:all_prices[symbol] for symbol in symbols if symbol in all_prices and float(all_prices[symbol])>0}
+
+async def _bulk_close_positions(request,stop_bot=False):
+ if stop_bot:
+  state.update(running=False,entry_paused=True)
+ ids=list(dict.fromkeys(int(x) for x in request.position_ids if int(x)>0))
+ if not ids:
+  return {'ok':True,'requested':0,'closed':[],'already_closed':[],'failed':[],'bot_stopped':stop_bot}
+ placeholders=','.join('?' for _ in ids)
+ c=db()
+ found=[dict(x) for x in c.execute(f'SELECT * FROM positions WHERE id IN ({placeholders})',ids).fetchall()]
+ c.close()
+ by_id={x['id']:x for x in found}
+ already=[{'id':position_id,'symbol':by_id.get(position_id,{}).get('symbol'),'reason':'ALREADY_CLOSED_OR_NOT_FOUND'} for position_id in ids if position_id not in by_id or by_id[position_id]['status']!='OPEN']
+ open_rows=[by_id[position_id] for position_id in ids if position_id in by_id and by_id[position_id]['status']=='OPEN']
+ symbols=list(dict.fromkeys(x['symbol'] for x in open_rows))
+ try:
+  prices=await bulk_market_prices(symbols) if symbols else {}
+ except Exception as e:
+  prices={}
+  market_error=f'{type(e).__name__}: public fiyat alınamadı'
+ else:
+  market_error=None
+ failed=[{'id':x['id'],'symbol':x['symbol'],'reason':market_error or 'Güncel public piyasa fiyatı bulunamadı'} for x in open_rows if x['symbol'] not in prices]
+ closable=[x for x in open_rows if x['symbol'] in prices]
+ fee_rate=max(float(settings.get('paper_fee_rate',0.0008) or 0),0.0)
+ now=datetime.now().isoformat(timespec='seconds')
+ def write(c):
+  closed=[]; raced=[]
+  for selected in closable:
+   pos=c.execute("SELECT * FROM positions WHERE id=? AND status='OPEN'",(selected['id'],)).fetchone()
+   if not pos:
+    raced.append({'id':selected['id'],'symbol':selected['symbol'],'reason':'ALREADY_CLOSED'})
+    continue
+   price=float(prices[selected['symbol']]); sign=1 if pos['side']=='LONG' else -1
+   rem=float(pos['remaining_qty'] or 0); realized=float(pos['pnl'] or 0); fee_paid=float(pos['fee_paid'] or 0)
+   realized+=(price-float(pos['entry']))*sign*rem
+   exit_fee=price*rem*fee_rate; realized-=exit_fee; fee_paid+=exit_fee
+   cur=c.execute("""UPDATE positions SET status='CLOSED',remaining_qty=0,closed_at=?,pnl=?,close_price=?,
+    fee_paid=?,close_reason='EMERGENCY_CLOSE' WHERE id=? AND status='OPEN'""",
+    (now,realized,price,fee_paid,pos['id']))
+   if cur.rowcount==1:
+    closed.append({'id':pos['id'],'symbol':pos['symbol'],'close_price':price,'pnl':realized})
+   else:
+    raced.append({'id':pos['id'],'symbol':pos['symbol'],'reason':'ALREADY_CLOSED'})
+  return closed,raced
+ closed,raced=_sqlite_write_with_retry(write) if closable else ([],[])
+ already.extend(raced)
+ for item in closed:
+  log(f"{item['symbol']} toplu PAPER kapanış @ {item['close_price']} | PnL ${item['pnl']:.2f}",'TRADE')
+ if failed:
+  log(f"Toplu PAPER kapanış kısmi kaldı · {len(failed)} pozisyon için güncel fiyat alınamadı",'WARN')
+ return {'ok':not failed,'requested':len(ids),'closed':closed,'already_closed':already,'failed':failed,'bot_stopped':stop_bot}
+
+@app.post('/api/positions/close-all')
+async def close_all_positions(request:BulkCloseRequest):
+ return await _bulk_close_positions(request,stop_bot=False)
+
+@app.post('/api/positions/close-all-and-stop')
+async def close_all_positions_and_stop(request:BulkCloseRequest):
+ return await _bulk_close_positions(request,stop_bot=True)
+
 @app.post('/api/positions/{position_id}/close')
 async def close_position(position_id:int):
  # Read first and close DB before any network wait.
@@ -1251,15 +1334,15 @@ async def close_position(position_id:int):
 
 @app.post('/api/start')
 async def start():
- state.update(running=True,panic=False,error=None)
+ state.update(running=True,panic=False,entry_paused=False,error=None)
  log('Motor başlatıldı · ilk tarama arka planda başladı')
  if not scan_lock.locked():
   asyncio.create_task(scan_once())
  return {'ok':True,'message':'Motor çalışıyor; ilk tarama arka planda başladı.'}
 @app.post('/api/stop')
-def stop():state['running']=False;log('Motor durduruldu');return {'ok':True}
+def stop():state.update(running=False,entry_paused=True);log('Bot durduruldu · yeni PAPER girişleri kapalı');return {'ok':True}
 @app.post('/api/panic')
-def panic():state.update(running=False,panic=True);log('ACİL DURDURMA etkin','WARN');return {'ok':True}
+def panic():state.update(running=False,panic=True,entry_paused=True);log('ACİL DURDURMA etkin','WARN');return {'ok':True}
 @app.post('/api/scan')
 async def scan():
  await scan_once(force_universe=True)

@@ -2,6 +2,8 @@
 <style>
 :root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#eef2ff;background:#08101f}body{margin:0}.wrap{max-width:1450px;margin:auto;padding:18px}.top{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.badge{border-radius:999px;padding:7px 11px;font-weight:800}.paper{background:#133c2e;color:#8ff0bd}button{border:0;border-radius:10px;padding:10px 14px;font-weight:700;cursor:pointer}.go{background:#22c55e}.stop{background:#f59e0b}.panic{background:#ef4444;color:white}.scan{background:#60a5fa}.ghost{background:#24324b;color:#e2e8f0}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:16px 0}.card{background:#111b2e;border:1px solid #26334d;border-radius:14px;padding:15px}.big{font-size:24px;font-weight:800}.muted{color:#94a3b8;font-size:13px}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:9px;border-bottom:1px solid #26334d;text-align:left;white-space:nowrap}section{margin-top:18px}h2{font-size:18px}.coins{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.long{color:#4ade80}.short{color:#fb7185}.wait{color:#fbbf24}.save{background:#a78bfa;margin-top:12px}.detail{margin-top:10px;padding-top:9px;border-top:1px solid #26334d}.detailRow{display:grid;grid-template-columns:1.6fr .55fr .55fr 1fr;gap:6px;padding:3px 0;font-size:11px}.opportunity{border-color:#fbbf24}.thresholdBar,.filters,.nav{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:10px 0 14px}.activeThreshold,.activeFilter,.nav button.active{outline:2px solid #fbbf24}.nav{position:sticky;top:0;z-index:20;background:#08101ff2;padding:10px 0}.page{display:none}.page.active{display:block}form{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}label{font-size:12px;color:#94a3b8}input{width:100%;box-sizing:border-box;margin-top:4px;padding:9px;background:#08101f;color:white;border:1px solid #334155;border-radius:8px}.pos{color:#4ade80}.neg{color:#fb7185}.summaryline{display:flex;gap:16px;flex-wrap:wrap;margin:8px 0 14px}.summaryline span{font-weight:700}
 .controlButtons{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.emergencyActions{margin:14px 0;padding:12px 14px;border:2px solid #7f1d1d;border-radius:14px;background:#2a0d15;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.emergencyActions strong{color:#fecaca}.emergencyButtons{display:flex;gap:10px;flex-wrap:wrap}.closeAll{background:#dc2626;color:white}.closeStop{background:#7f1d1d;color:white;border:1px solid #f87171}
 .controlButtons button{transition:transform .12s ease,opacity .12s ease,box-shadow .12s ease,filter .12s ease}
 .controlButtons button.activeControl{box-shadow:0 0 0 3px rgba(255,255,255,.22),0 0 22px rgba(255,255,255,.08);transform:translateY(-1px);filter:saturate(1.25) brightness(1.08)}
 .controlButtons button:disabled{cursor:not-allowed;opacity:.32;filter:grayscale(.55);transform:none;box-shadow:none}
@@ -81,7 +83,8 @@
 }
 
 </style></head><body><div class="wrap">
-<div class="top"><div><h1 style="margin:0">MEXC Trader <span class="badge paper">PAPER / SANAL</span></h1><div class="muted">Faz 1.8.3 · Kripto-only Top-30 Futures · Canlı P&L · Manuel pozisyon kapatma · localhost:8071</div></div><div class="controlButtons"><button id="btnStart" class="go" onclick="post('/api/start')">▶ Başlat</button><button id="btnStop" class="stop" onclick="post('/api/stop')">■ Durdur</button><button id="btnScan" class="scan" onclick="post('/api/scan')">↻ Şimdi Tara</button><button id="btnPanic" class="panic" onclick="post('/api/panic')">ACİL DURDUR</button></div></div>
+<div class="top"><div><h1 style="margin:0">MEXC Trader <span class="badge paper">PAPER / SANAL</span></h1><div class="muted">Faz 1.8.3 · Kripto-only Top-30 Futures · Canlı P&L · Manuel pozisyon kapatma · localhost:8071</div></div><div class="controlButtons"><button id="btnStart" class="go" onclick="post('/api/start')">▶ Başlat</button><button id="btnStop" class="stop" onclick="post('/api/stop')">■ BOTU DURDUR</button><button id="btnScan" class="scan" onclick="post('/api/scan')">↻ Şimdi Tara</button></div></div>
+<div class="emergencyActions"><div><strong>ACİL PAPER POZİSYON İŞLEMLERİ</strong><div class="muted">Yalnız ana PAPER pozisyonlarını etkiler; gerçek MEXC emri göndermez.</div></div><div class="emergencyButtons"><button id="btnCloseAll" class="closeAll" onclick="confirmBulkClose(false)">TÜM POZİSYONLARI KAPAT</button><button id="btnCloseAllStop" class="closeStop" onclick="confirmBulkClose(true)">TÜMÜNÜ KAPAT VE BOTU DURDUR</button></div></div>
 <div class="statusStrip">
  <div class="statusItem"><div class="statusLabel">Bot Durumu</div><div id="botStatusTop" class="statusValue"><span class="dot"></span>YÜKLENİYOR</div></div>
  <div class="statusItem"><div class="statusLabel">MEXC Futures</div><div id="mexcStatusTop" class="statusValue"><span class="dot"></span>TEST EDİLMEDİ</div></div>
@@ -171,15 +174,13 @@ function setTopState(d){
  const rateWait=Number(d.state.rate_limit_wait||0);
  const pub=(d.state.public_api||'TEST EDİLMEDİ').toUpperCase();
 
- const bStart=document.getElementById('btnStart'),bStop=document.getElementById('btnStop'),bScan=document.getElementById('btnScan'),bPanic=document.getElementById('btnPanic');
+ const bStart=document.getElementById('btnStart'),bStop=document.getElementById('btnStop'),bScan=document.getElementById('btnScan');
  bStart.disabled=running&&!panic;
  bStop.disabled=!running||panic;
  bScan.disabled=scanning||panic;
- bPanic.disabled=panic;
  bStart.classList.toggle('activeControl',running&&!panic);
  bStop.classList.toggle('activeControl',!running&&!panic);
  bScan.classList.toggle('activeControl',scanning);
- bPanic.classList.toggle('activeControl',panic);
 
  let bot=document.getElementById('botStatusTop');
  if(panic){bot.innerHTML='<span class="dot bad"></span>ACİL DURDURMA AKTİF';bot.className='statusValue stateBad'}
@@ -256,6 +257,27 @@ function toggleScannerDetail(id,btn){
  if(btn)btn.textContent=open?'Kapat':'Detay';
 }
 
+let bulkCloseInFlight=false;
+async function confirmBulkClose(stopBot){
+ if(bulkCloseInFlight)return;
+ try{
+  let previewResponse=await fetch('/api/positions/open-summary'),preview=await previewResponse.json();
+  if(!previewResponse.ok)throw new Error(preview.detail||previewResponse.status);
+  if(!preview.count){alert('Kapatılacak açık ana PAPER pozisyonu yok.');return}
+  let symbols=preview.positions.map(x=>x.symbol).join(', ');
+  let action=stopBot?'BOT DURDURULACAK ve tüm açık ana PAPER pozisyonları kapatılacak':'Bot çalışmaya devam edecek ve tüm açık ana PAPER pozisyonları kapatılacak';
+  if(!confirm(`${action}.\n\nKapatılacak pozisyon sayısı: ${preview.count}\n${symbols}\n\nBu işlemi açıkça onaylıyor musunuz?`))return;
+  bulkCloseInFlight=true;btnCloseAll.disabled=true;btnCloseAllStop.disabled=true;
+  let endpoint=stopBot?'/api/positions/close-all-and-stop':'/api/positions/close-all';
+  let response=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({position_ids:preview.positions.map(x=>x.id)})});
+  let result=await response.json();if(!response.ok)throw new Error(result.detail||response.status);
+  let lines=[`${result.closed.length} pozisyon kapatıldı.`];
+  if(result.already_closed.length)lines.push(`${result.already_closed.length} pozisyon daha önce kapanmıştı; tekrar kapatılmadı.`);
+  if(result.failed.length)lines.push('KAPANAMAYAN POZİSYONLAR:\n'+result.failed.map(x=>`${x.symbol||('#'+x.id)} — ${x.reason}`).join('\n'));
+  alert(lines.join('\n\n'));await loadHistory();await refresh();
+ }catch(e){alert('Toplu PAPER kapanış tamamlanamadı: '+e.message)}
+ finally{bulkCloseInFlight=false;btnCloseAll.disabled=false;btnCloseAllStop.disabled=false}
+}
 async function closePosition(id,symbol,side){if(!confirm(`${symbol} ${side} PAPER pozisyonunu anlık fiyattan kapatmak istiyor musun?`))return;try{let j=await post(`/api/positions/${id}/close`);alert(`${symbol} kapatıldı. Gerçekleşen K/Z: ${money(j.pnl)}`);await loadHistory();await refresh()}catch(e){alert('Pozisyon kapatılamadı: '+e.message)}}
 async function save(){let o={};new FormData(settings).forEach((v,k)=>o[k]=Number(v));await post('/api/settings',o)}refresh();refreshHealth();loadHistory();setInterval(()=>{refresh();refreshHealth();if(document.getElementById('positionsPage').classList.contains('active'))loadHistory();if(document.getElementById('strategyLabPage').classList.contains('active'))loadStrategyLab()},5000);
 </script></body></html>

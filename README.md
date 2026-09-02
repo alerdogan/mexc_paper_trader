@@ -198,3 +198,11 @@ Top-30 havuzu yalnızca MEXC Spot tarafında gerçek USDT kripto çifti bulunan 
 - RSI, hacim oranı, destek/direnç mesafeleri, en yakın Fibonacci seviyesi/mesafesi ve 15m/1h/4h trend yönleri ham snapshot olarak saklanır.
 - Mevcut score algoritması ve ağırlıkları değiştirilmez; eski işlemler snapshot kaydı olmadan korunur.
 - Strategy Lab deneyi `source_position_id` üzerinden aynı değişmez snapshot'a bağlanabilir.
+
+## Güvenli toplu PAPER kontrolleri
+- `BOTU DURDUR` yalnız yeni PAPER girişlerini engeller; açık pozisyonları kapatmaz.
+- Toplu kapatma butonları önce açık ana PAPER pozisyonlarının güncel sayısını ve listesini göstererek açık kullanıcı onayı ister.
+- `TÜM POZİSYONLARI KAPAT` bot durumunu değiştirmez; birleşik aksiyon önce yeni girişleri durdurur.
+- Kapanışlar public piyasa fiyatıyla ve `EMERGENCY_CLOSE` reason ile kaydedilir; gerçek MEXC emri gönderilmez.
+- Onaylanan pozisyon ID listesi ve koşullu `status='OPEN'` güncellemesi tekrar istekte duplicate kapanışı engeller.
+- Fiyatı alınamayan pozisyon açık bırakılır ve kullanıcıya açıkça bildirilir; Strategy Lab run'ları zorla kapatılmaz.
