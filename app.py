@@ -16,6 +16,7 @@ settings=DEFAULTS.copy(); state={"running":False,"panic":False,"last_scan":None,
 TASK_NAMES=('scanner','position_engine','ghost_analyzer')
 STRATEGY_LAB_MODELS=('CURRENT','NO_STOP_MINI','SMART_EXIT')
 STRATEGY_LAB_VERSION='1.0'
+SCORE_SNAPSHOT_VERSION='1.0'
 SUPERVISOR_BACKOFF=(1,2,5,10,30)
 background_tasks={}
 
@@ -89,6 +90,16 @@ def init_db():
   UNIQUE(experiment_id,model),FOREIGN KEY(experiment_id) REFERENCES strategy_lab_experiments(id)
  )''')
  c.execute('CREATE INDEX IF NOT EXISTS idx_strategy_lab_runs_status ON strategy_lab_runs(status)')
+ c.execute('''CREATE TABLE IF NOT EXISTS position_score_snapshots(
+  position_id INTEGER PRIMARY KEY,score_version TEXT NOT NULL,signal_side TEXT NOT NULL,captured_at TEXT NOT NULL,
+  trend_score REAL,trend_4h_score REAL,trend_1h_score REAL,trend_15m_score REAL,
+  support_resistance_score REAL,volume_score REAL,rsi_score REAL,fibonacci_score REAL,total_score REAL NOT NULL,
+  rsi_value REAL,volume_ratio REAL,support_price REAL,resistance_price REAL,
+  support_distance REAL,resistance_distance REAL,support_distance_pct REAL,resistance_distance_pct REAL,
+  fibonacci_near INTEGER,fibonacci_level REAL,fibonacci_distance REAL,fibonacci_distance_pct REAL,
+  trend_15m INTEGER,trend_1h INTEGER,trend_4h INTEGER,score_details_json TEXT,
+  FOREIGN KEY(position_id) REFERENCES positions(id)
+ )''')
  # Existing open positions can only be tracked accurately from this upgrade forward.
  now_iso=datetime.now().isoformat(timespec='seconds')
  c.execute("UPDATE positions SET tracking_started_at=? WHERE status='OPEN' AND tracking_started_at IS NULL",(now_iso,))
@@ -274,26 +285,27 @@ async def klines(client,symbol,tf,limit=120):
  rows.sort(key=lambda x:x[0]); return rows[-limit:]
 def metrics(rows):
  closes=[x[4] for x in rows]; vols=[x[5] for x in rows]; e20,e50=ema(closes[-80:],20),ema(closes[-100:],50); recent=rows[-30:]; p=closes[-1]; hi=max(x[2] for x in rows[-60:]); lo=min(x[3] for x in rows[-60:]); fibs=[hi-(hi-lo)*x for x in (.382,.5,.618)]
- return {'price':p,'ema20':e20,'ema50':e50,'rsi':rsi(closes),'atr':atr(rows),'support':min(x[3] for x in recent),'resistance':max(x[2] for x in recent),'volume_ratio':(sum(vols[-5:])/5)/(sum(vols[-25:-5])/20 or 1),'trend':1 if p>e20>e50 else (-1 if p<e20<e50 else 0),'fib_near':min(abs(p-f) for f in fibs)/(p or 1)<.003}
+ nearest_fib=min(fibs,key=lambda f:abs(p-f)); fib_distance=abs(p-nearest_fib)
+ return {'price':p,'ema20':e20,'ema50':e50,'rsi':rsi(closes),'atr':atr(rows),'support':min(x[3] for x in recent),'resistance':max(x[2] for x in recent),'volume_ratio':(sum(vols[-5:])/5)/(sum(vols[-25:-5])/20 or 1),'trend':1 if p>e20>e50 else (-1 if p<e20<e50 else 0),'fib_near':fib_distance/(p or 1)<.003,'nearest_fib':nearest_fib,'fib_distance':fib_distance,'fib_distance_pct':fib_distance/(p or 1)*100}
 def scores(m):
  L=S=0; details=[]
  trend_names={'4h':'4 saat trend','1h':'1 saat trend','15m':'15 dk trend'}
  for tf,w in [('4h',20),('1h',15),('15m',10)]:
   lp=w if m[tf]['trend']==1 else 0; sp=w if m[tf]['trend']==-1 else 0
-  L+=lp; S+=sp; details.append({'name':trend_names[tf],'long':lp,'short':sp,'note':'Yukarı' if m[tf]['trend']==1 else ('Aşağı' if m[tf]['trend']==-1 else 'Yatay/kararsız')})
- rr=m['15m']['rsi']; lp=15 if 52<=rr<=70 else 0; sp=15 if 30<=rr<=48 else 0; L+=lp; S+=sp; details.append({'name':'RSI','long':lp,'short':sp,'note':f'{rr:.1f}'})
+  L+=lp; S+=sp; details.append({'component':'trend','timeframe':tf,'name':trend_names[tf],'long':lp,'short':sp,'note':'Yukarı' if m[tf]['trend']==1 else ('Aşağı' if m[tf]['trend']==-1 else 'Yatay/kararsız')})
+ rr=m['15m']['rsi']; lp=15 if 52<=rr<=70 else 0; sp=15 if 30<=rr<=48 else 0; L+=lp; S+=sp; details.append({'component':'rsi','name':'RSI','long':lp,'short':sp,'note':f'{rr:.1f}'})
  vr=m['15m']['volume_ratio']; lp=sp=0
  if vr>=1.25:
   if m['15m']['trend']>=0:lp=15; L+=15
   if m['15m']['trend']<=0:sp=15; S+=15
- details.append({'name':'Hacim teyidi','long':lp,'short':sp,'note':f'{vr:.2f}x'})
+ details.append({'component':'volume','name':'Hacim teyidi','long':lp,'short':sp,'note':f'{vr:.2f}x'})
  p=m['15m']['price']; a=m['15m']['atr'] or p*.005; lp=15 if m['15m']['resistance']-p>=2*a else 0; sp=15 if p-m['15m']['support']>=2*a else 0; L+=lp; S+=sp
- details.append({'name':'Destek / direnç alanı','long':lp,'short':sp,'note':f'D {m["15m"]["support"]:.6g} · R {m["15m"]["resistance"]:.6g}'})
+ details.append({'component':'support_resistance','name':'Destek / direnç alanı','long':lp,'short':sp,'note':f'D {m["15m"]["support"]:.6g} · R {m["15m"]["resistance"]:.6g}'})
  lp=sp=0
  if m['15m']['fib_near']:
   if m['1h']['trend']==1:lp=10; L+=10
   if m['1h']['trend']==-1:sp=10; S+=10
- details.append({'name':'Fibonacci yakınlığı','long':lp,'short':sp,'note':'Yakın' if m['15m']['fib_near'] else 'Yakın değil'})
+ details.append({'component':'fibonacci','name':'Fibonacci yakınlığı','long':lp,'short':sp,'note':'Yakın' if m['15m']['fib_near'] else 'Yakın değil'})
  return min(L,100),min(S,100),details
 def open_risk():
  c=db(); x=c.execute("SELECT COALESCE(SUM(risk_usd),0) x FROM positions WHERE status='OPEN'").fetchone()['x']; c.close(); return float(x)
@@ -464,6 +476,44 @@ def strategy_lab_open_symbols():
  c.close()
  return [r['symbol'] for r in rows]
 
+def score_snapshot(m,side,total_score,captured_at):
+ direction='long' if side=='LONG' else 'short'
+ details=m.get('score_details') or []
+ def component_score(component,timeframe=None):
+  matches=[x for x in details if x.get('component')==component and (timeframe is None or x.get('timeframe')==timeframe)]
+  return sum(float(x.get(direction) or 0) for x in matches) if matches else None
+ m15=m.get('15m') or {}; price=float(m15.get('price') or 0)
+ support=m15.get('support'); resistance=m15.get('resistance')
+ support_distance=price-float(support) if support is not None else None
+ resistance_distance=float(resistance)-price if resistance is not None else None
+ return {
+  'score_version':SCORE_SNAPSHOT_VERSION,'signal_side':side,'captured_at':captured_at,
+  'trend_score':component_score('trend'),
+  'trend_4h_score':component_score('trend','4h'),'trend_1h_score':component_score('trend','1h'),
+  'trend_15m_score':component_score('trend','15m'),
+  'support_resistance_score':component_score('support_resistance'),
+  'volume_score':component_score('volume'),'rsi_score':component_score('rsi'),
+  'fibonacci_score':component_score('fibonacci'),'total_score':float(total_score),
+  'rsi_value':m15.get('rsi'),'volume_ratio':m15.get('volume_ratio'),
+  'support_price':support,'resistance_price':resistance,
+  'support_distance':support_distance,'resistance_distance':resistance_distance,
+  'support_distance_pct':support_distance/(price or 1)*100 if support_distance is not None else None,
+  'resistance_distance_pct':resistance_distance/(price or 1)*100 if resistance_distance is not None else None,
+  'fibonacci_near':int(bool(m15.get('fib_near'))) if 'fib_near' in m15 else None,
+  'fibonacci_level':m15.get('nearest_fib'),'fibonacci_distance':m15.get('fib_distance'),
+  'fibonacci_distance_pct':m15.get('fib_distance_pct'),
+  'trend_15m':m15.get('trend'),'trend_1h':(m.get('1h') or {}).get('trend'),
+  'trend_4h':(m.get('4h') or {}).get('trend'),
+  'score_details_json':json.dumps(details,ensure_ascii=False,separators=(',',':')),
+ }
+
+def _insert_score_snapshot(c,position_id,snapshot):
+ columns=['position_id',*snapshot.keys()]
+ c.execute(
+  f"INSERT INTO position_score_snapshots ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+  (position_id,*snapshot.values())
+ )
+
 def has_open(sym):
  c=db(); r=c.execute("SELECT 1 FROM positions WHERE status='OPEN' AND symbol=?",(sym,)).fetchone(); c.close(); return bool(r)
 def paper_open(sym,side,m,sc):
@@ -494,8 +544,10 @@ def paper_open(sym,side,m,sc):
  fee_rate=max(float(settings.get('paper_fee_rate',0.0008) or 0),0.0)
  entry_fee=p*qty*fee_rate
  opened=datetime.now().isoformat(timespec='seconds')
+ snapshot=score_snapshot(m,side,sc,opened)
  def write(c):
   cur=c.execute('''INSERT INTO positions(symbol,side,status,entry,stop,initial_stop,qty,remaining_qty,risk_usd,score,opened_at,pnl,fee_paid,mae_r,mfe_r,tracking_started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(sym,side,'OPEN',p,stop,stop,qty,qty,actual,sc,opened,-entry_fee,entry_fee,0.0,0.0,opened))
+  _insert_score_snapshot(c,cur.lastrowid,snapshot)
   return cur.lastrowid
  position_id=_sqlite_write_with_retry(write)
  try:

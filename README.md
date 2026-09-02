@@ -192,3 +192,9 @@ Top-30 havuzu yalnızca MEXC Spot tarafında gerçek USDT kripto çifti bulunan 
 - SMART_EXIT stop temasından sonra 15 dakika teyit bekler ve -1,5R sert sınır uygular.
 - Strategy Lab ekranı modellerin K/Z, başarı, profit factor, MAE/MFE ve CURRENT stopundan sonra kâra dönüş sayılarını yan yana gösterir.
 - Kâra dönüş, CURRENT stop zamanından sonra fee dahil net K/Z'nin sıfırın üzerine çıkması olarak ölçülür.
+
+## Score breakdown snapshot
+- Yeni PAPER işlemlerinde açılan yönün trend, RSI, hacim, destek/direnç ve Fibonacci puanları giriş anında `position_score_snapshots` tablosuna sabitlenir.
+- RSI, hacim oranı, destek/direnç mesafeleri, en yakın Fibonacci seviyesi/mesafesi ve 15m/1h/4h trend yönleri ham snapshot olarak saklanır.
+- Mevcut score algoritması ve ağırlıkları değiştirilmez; eski işlemler snapshot kaydı olmadan korunur.
+- Strategy Lab deneyi `source_position_id` üzerinden aynı değişmez snapshot'a bağlanabilir.
