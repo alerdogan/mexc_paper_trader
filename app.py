@@ -14,7 +14,7 @@ SERVICE_STARTED_MONOTONIC=time.monotonic()
 DEFAULTS={"symbols":["BTC_USDT"],"top_volume_count":30,"universe_refresh_minutes":15,"paper_balance":4000.0,"risk_per_trade_usd":20.0,"max_alt_notional_usd":5000.0,"max_btc_notional_usd":10000.0,"max_total_open_risk_usd":100.0,"daily_loss_limit_usd":300.0,"leverage":2,"signal_threshold":80,"scan_seconds":30,"stop_atr_mult":1.5,"tp1_r":1.0,"tp1_pct":30.0,"tp2_r":2.0,"tp2_pct":30.0,"runner_pct":40.0,"move_be_at_r":1.0,"min_free_balance_pct":20.0,"paper_fee_rate":0.0008}
 settings=DEFAULTS.copy(); state={"running":False,"panic":False,"entry_paused":False,"last_scan":None,"market":{},"live_prices":{},"last_price_update":None,"scanning":False,"error":None,"feed":"MEXC FUTURES","public_api":None,"api_saved":False,"private_api":None,"paper_test_threshold":None,"universe":[],"universe_updated":None,"scan_duration_sec":None,"rate_limit_wait":None}
 TASK_NAMES=('scanner','position_engine','ghost_analyzer')
-STRATEGY_LAB_MODELS=('CURRENT','NO_STOP_MINI','SMART_EXIT')
+STRATEGY_LAB_MODELS=('CURRENT','NO_STOP_MINI','SMART_EXIT','TRAILING_RUNNER')
 STRATEGY_LAB_VERSION='1.0'
 SCORE_SNAPSHOT_VERSION='1.0'
 SUPERVISOR_BACKOFF=(1,2,5,10,30)
@@ -388,7 +388,7 @@ def _strategy_lab_manage_once(c):
  for raw in rows:
   run=dict(raw)
   price=float((state.get('live_prices') or {}).get(run['symbol']) or (state.get('market',{}).get(run['symbol']) or {}).get('price') or 0)
-  if run['model']=='CURRENT' and run['source_status']=='CLOSED' and run['source_close_reason']=='EMERGENCY_CLOSE':
+  if run['source_status']=='CLOSED' and run['source_close_reason']=='EMERGENCY_CLOSE':
    continue
   if run['model']=='CURRENT':
    if run['source_status']=='CLOSED':
@@ -414,6 +414,32 @@ def _strategy_lab_manage_once(c):
   run['mae_r']=mae; run['mfe_r']=mfe
   if run['source_status']=='CLOSED' and run['source_close_reason'] not in ('STOP','EMERGENCY_CLOSE'):
    _strategy_lab_close(c,run,price,'CURRENT_'+str(run['source_close_reason'] or 'CLOSE'),now)
+   continue
+  if run['model']=='TRAILING_RUNNER':
+   rem=float(run['remaining_qty']); realized=float(run['realized_pnl']); fee=float(run['fee_paid'])
+   stop=float(run['stop']); tp1_done=int(run['tp1_done'] or 0); tp2_done=int(run['tp2_done'] or 0)
+   if tp2_done:
+    trailing_r=max(1.0,mfe-1.0)
+    candidate=float(run['entry'])+sign*trailing_r*risk_distance
+    stop=max(stop,candidate) if sign==1 else min(stop,candidate)
+   hit_stop=(run['side']=='LONG' and price<=stop) or (run['side']=='SHORT' and price>=stop)
+   if hit_stop:
+    _strategy_lab_close(c,run,price,'RUNNER_TRAILING_STOP' if tp2_done else 'STOP',now)
+    continue
+   if progress>=float(settings['tp1_r']) and not tp1_done:
+    q=min(float(run['qty'])*float(settings['tp1_pct'])/100.0,rem)
+    realized+=(price-float(run['entry']))*sign*q-price*q*fee_rate; fee+=price*q*fee_rate; rem-=q
+    stop=float(run['entry']); tp1_done=1
+   if progress>=float(settings['tp2_r']) and not tp2_done:
+    q=min(float(run['qty'])*float(settings['tp2_pct'])/100.0,rem)
+    realized+=(price-float(run['entry']))*sign*q-price*q*fee_rate; fee+=price*q*fee_rate; rem-=q
+    stop=float(run['entry'])+sign*risk_distance; tp2_done=1
+   if tp2_done:
+    trailing_r=max(1.0,mfe-1.0)
+    candidate=float(run['entry'])+sign*trailing_r*risk_distance
+    stop=max(stop,candidate) if sign==1 else min(stop,candidate)
+   c.execute('''UPDATE strategy_lab_runs SET remaining_qty=?,realized_pnl=?,fee_paid=?,stop=?,
+    tp1_done=?,tp2_done=?,updated_at=? WHERE id=?''',(rem,realized,fee,stop,tp1_done,tp2_done,now,run['id']))
    continue
   trigger=run['stop_triggered_at']
   if not trigger:
@@ -1129,7 +1155,7 @@ def strategy_lab():
  c=db()
  experiments=[dict(x) for x in c.execute('''SELECT * FROM strategy_lab_experiments
   ORDER BY id DESC LIMIT 200''').fetchall()]
- runs=[dict(x) for x in c.execute('''SELECT r.*,e.symbol,e.side,e.current_stopped_at
+ runs=[dict(x) for x in c.execute('''SELECT r.*,e.symbol,e.side,e.initial_stop,e.current_stopped_at
   FROM strategy_lab_runs r JOIN strategy_lab_experiments e ON e.id=r.experiment_id
   ORDER BY r.experiment_id DESC,r.id''').fetchall()]
  c.close()
@@ -1140,6 +1166,11 @@ def strategy_lab():
   sign=1 if run['side']=='LONG' else -1
   run['net_pnl']=float(run['realized_pnl'] or 0)+(price-float(run['entry']))*sign*float(run['remaining_qty'] or 0)
   run['current_price']=price
+  risk_distance=max(abs(float(run['entry'])-float(run['initial_stop'])),1e-12)
+  run['current_r']=(price-float(run['entry']))*sign/risk_distance
+  run['max_favorable_r']=float(run['mfe_r'] or 0)
+  run['runner_trailing_stop_price']=float(run['stop']) if run['model']=='TRAILING_RUNNER' and run['tp2_done'] else None
+  run['runner_trailing_stop_r']=((float(run['stop'])-float(run['entry']))*sign/risk_distance) if run['model']=='TRAILING_RUNNER' and run['tp2_done'] else None
   model_rows.setdefault(run['model'],[]).append(run)
   if run['experiment_id'] in by_experiment:
    by_experiment[run['experiment_id']]['models'][run['model']]=run

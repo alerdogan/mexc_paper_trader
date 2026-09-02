@@ -185,13 +185,16 @@ Top-30 havuzu yalnızca MEXC Spot tarafında gerçek USDT kripto çifti bulunan 
 - Kullanılabilir margin hesabı güncel realize edilmiş kasa üzerinden hesaplanır.
 
 ## Strategy Lab — SHADOW MODEL KARŞILAŞTIRMASI
-- Her yeni PAPER girişi CURRENT, NO_STOP_MINI ve SMART_EXIT modellerinde aynı anda, tamamen sanal olarak izlenir.
+- Her yeni PAPER girişi CURRENT, NO_STOP_MINI, SMART_EXIT ve TRAILING_RUNNER modellerinde aynı anda, tamamen sanal olarak izlenir.
 - Lab kayıtları ana PAPER bakiye, risk ve pozisyon tablolarını etkilemez.
 - CURRENT gerçek PAPER davranışını referans alır.
 - NO_STOP_MINI stopta kalan miktarın %85'ini kapatır, %15 mini kısmı en fazla 2 saat izler ve -2R sert sınır uygular.
 - SMART_EXIT stop temasından sonra 15 dakika teyit bekler ve -1,5R sert sınır uygular.
 - Strategy Lab ekranı modellerin K/Z, başarı, profit factor, MAE/MFE ve CURRENT stopundan sonra kâra dönüş sayılarını yan yana gösterir.
 - Kâra dönüş, CURRENT stop zamanından sonra fee dahil net K/Z'nin sıfırın üzerine çıkması olarak ölçülür.
+- TRAILING_RUNNER, CURRENT ile aynı TP1/TP2 akışını kullanır; TP2 sonrasında kalan %40 için `max_favorable_R - 1R` stopunu uygular.
+- Runner stopu yalnız kâr yönünde sıkılaşır ve tetiklendiğinde `RUNNER_TRAILING_STOP` reason ile kapanır.
+- Eski experiment'lara geriye dönük run eklenmez; model yalnız yeni Strategy Lab experiment'larında başlar.
 
 ## Score breakdown snapshot
 - Yeni PAPER işlemlerinde açılan yönün trend, RSI, hacim, destek/direnç ve Fibonacci puanları giriş anında `position_score_snapshots` tablosuna sabitlenir.
