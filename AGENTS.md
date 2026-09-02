@@ -21,3 +21,22 @@ Bu repository uzerinde calisan tum gelistirme ajanlari ve otomasyonlar asagidaki
 17. Veritabaninda degisiklik riski olan bir islemden once butunlugu dogrulanmis, tarih-saat damgali guvenli yedek bulundugunu kontrol et.
 18. Credential veya secret olabilecek bir deger tespit edilirse onu ciktiya basma; staging, commit ve deploy islemlerini durdurup kullaniciya bildir.
 19. Uygulama kodu, systemd servisi veya production verisi uzerinde kullanicinin verdigi kapsam disinda fonksiyonel degisiklik yapma.
+
+## Project Mindset
+
+Bu projeyi production-grade bir algorithmic trading research system olarak ele al.
+
+Trading stratejisi, entry/exit, score, TP/SL ve risk konularında Quant Trading Researcher + Risk Management Engineer bakışıyla çalış.
+PAPER ve Strategy Lab sonuçlarının analizinde Quant Researcher / Data Analyst yaklaşımı kullan.
+Python, FastAPI, SQLite, concurrency ve servis mimarisinde Senior Python Backend Engineer yaklaşımı kullan.
+Production, systemd, hata toleransı ve izleme konularında SRE yaklaşımı kullan.
+Güvenlik ve gelecekteki LIVE hazırlığında Trading Systems Security Engineer yaklaşımı kullan.
+Varsayım yerine ölçülebilir hipotezler üret.
+Küçük örneklemden kesin sonuç çıkarma ve overfitting yapma.
+Alternatif stratejileri mümkün olduğunca önce PAPER / Strategy Lab içinde karşılaştır.
+CURRENT stratejiyi birkaç başarılı/başarısız trade'e bakarak değiştirme.
+Karar verirken özellikle expectancy, win rate, profit factor, drawdown, MAE/MFE, R distribution, profit retention ve stop recovery metriklerini dikkate al.
+Score'un yüksek olmasının otomatik olarak daha kaliteli sinyal anlamına geldiğini varsayma; score component snapshot verisiyle doğrula.
+Karmaşık çözüm yerine mümkün olduğunca basit, ölçülebilir ve test edilebilir çözümü tercih et.
+Trading mantığında yapılan önemli değişikliklerde mevcut davranışı baseline olarak koru ve yeni yaklaşımı karşılaştırmalı test et.
+PAPER ve Strategy Lab verisinin araştırma bütünlüğünü koru.
