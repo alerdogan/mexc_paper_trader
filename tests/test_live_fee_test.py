@@ -65,6 +65,26 @@ def test_arm_is_local_and_does_not_enable_orders(isolated_app):
     assert module._live_fee_row(("ARMED",))["id"] == result["id"]
 
 
+def test_cancel_only_disarms_non_executing_test(isolated_app):
+    module, _ = isolated_app
+    module.arm_live_fee_test(LocalRequest())
+
+    result = module.cancel_live_fee_test(LocalRequest())
+
+    assert result == {"status": "CANCELLED", "orders_enabled": False}
+    assert module._live_fee_row(("ARMED", "PREPARED")) is None
+
+    connection = module.db()
+    connection.execute(
+        "INSERT INTO live_fee_tests(status,armed_at) VALUES('EXECUTING','2026-01-01T00:00:00')"
+    )
+    connection.commit()
+    connection.close()
+    with pytest.raises(HTTPException) as exc:
+        module.cancel_live_fee_test(LocalRequest())
+    assert exc.value.status_code == 409
+
+
 def test_execute_requires_exact_explicit_confirmation(isolated_app, monkeypatch):
     module, _ = isolated_app
     prepared_candidate(module)

@@ -1646,6 +1646,19 @@ def arm_live_fee_test(request:Request):
  log('LIVE_FEE_TEST yalnız aday beklemek üzere ARMED; gerçek emir DEVRE DIŞI','WARN')
  return {'id':test_id,'status':'ARMED','orders_enabled':False}
 
+@app.post('/api/live-fee-test/cancel')
+def cancel_live_fee_test(request:Request):
+ _require_local(request)
+ def write(c):
+  cur=c.execute("""UPDATE live_fee_tests SET status='CANCELLED',completed_at=?,error=NULL
+   WHERE id=(SELECT id FROM live_fee_tests WHERE status IN ('ARMED','PREPARED') ORDER BY id DESC LIMIT 1)
+   AND status IN ('ARMED','PREPARED')""",(datetime.now().isoformat(timespec='seconds'),))
+  return cur.rowcount
+ if _sqlite_write_with_retry(write)!=1:
+  raise HTTPException(409,'İptal edilebilir ARMED/PREPARED LIVE_FEE_TEST yok; çalışan veya alarmdaki test iptal edilemez.')
+ log('LIVE_FEE_TEST kullanıcı tarafından iptal edildi; gerçek emir DEVRE DIŞI','WARN')
+ return {'status':'CANCELLED','orders_enabled':False}
+
 class LiveFeeExecute(BaseModel): confirmation:str
 
 @app.post('/api/live-fee-test/execute')
