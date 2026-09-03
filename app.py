@@ -1,5 +1,6 @@
 from typing import Optional
-import asyncio, json, sqlite3, subprocess, hmac, hashlib, os, random, sys, time
+import asyncio, json, sqlite3, subprocess, hmac, hashlib, os, random, sys, time, uuid
+from decimal import Decimal, ROUND_CEILING
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlencode
@@ -20,6 +21,9 @@ SCORE_SNAPSHOT_VERSION='1.0'
 MARKET_REGIME_SNAPSHOT_VERSION='1.0'
 SUPERVISOR_BACKOFF=(1,2,5,10,30)
 background_tasks={}
+live_fee_test_lock=asyncio.Lock()
+LIVE_FEE_TEST_EXPIRY_SECONDS=600
+LIVE_FEE_TEST_ESTIMATED_TAKER_RATE=0.0008
 
 def _new_task_status():
  return {'alive':False,'running':False,'last_success':None,'last_error':None,'restart_count':0,'consecutive_failures':0,'restart_delay_seconds':None}
@@ -114,6 +118,15 @@ def init_db():
   eth_15m_price REAL,eth_15m_ema20 REAL,eth_15m_ema50 REAL,eth_15m_momentum TEXT,
   eth_15m_rsi REAL,eth_15m_volume_ratio REAL,
   FOREIGN KEY(source_position_id) REFERENCES positions(id)
+ )''')
+ c.execute('''CREATE TABLE IF NOT EXISTS live_fee_tests(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,status TEXT NOT NULL,armed_at TEXT NOT NULL,
+  candidate_at TEXT,expires_at TEXT,symbol TEXT,side TEXT,score REAL,reference_price REAL,
+  contract_size REAL,contracts REAL,leverage INTEGER,estimated_taker_rate REAL,
+  estimated_entry_fee REAL,estimated_exit_fee REAL,max_estimated_loss REAL,
+  execution_started_at TEXT,entry_order_id TEXT,entry_fill_json TEXT,
+  exit_order_id TEXT,exit_fill_json TEXT,funding REAL DEFAULT 0,result_json TEXT,
+  error TEXT,completed_at TEXT
  )''')
  # Existing open positions can only be tracked accurately from this upgrade forward.
  now_iso=datetime.now().isoformat(timespec='seconds')
@@ -629,6 +642,100 @@ def _insert_market_regime_snapshot(c,position_id,snapshot):
   (position_id,*snapshot.values())
  )
 
+def _live_fee_row(statuses):
+ c=db(); marks=','.join('?' for _ in statuses)
+ row=c.execute(f"SELECT * FROM live_fee_tests WHERE status IN ({marks}) ORDER BY id DESC LIMIT 1",tuple(statuses)).fetchone()
+ c.close(); return dict(row) if row else None
+
+def _live_fee_update(test_id,**values):
+ if not values:return
+ def write(c):
+  c.execute(f"UPDATE live_fee_tests SET {','.join(k+'=?' for k in values)} WHERE id=?",(*values.values(),test_id))
+ _sqlite_write_with_retry(write)
+
+def _contract_detail(data,symbol):
+ items=data if isinstance(data,list) else [data]
+ return next((x for x in items if str(x.get('symbol'))==symbol),None)
+
+async def maybe_prepare_live_fee_test(client,current_market,previous_market,universe_symbols):
+ armed=_live_fee_row(('ARMED',))
+ if not armed:return
+ candidates=[]
+ for symbol in universe_symbols:
+  market=current_market.get(symbol) or {}; previous=previous_market.get(symbol) or {}
+  score=max(float(market.get('long_score') or 0),float(market.get('short_score') or 0))
+  if score!=100 or market.get('signal') not in ('LONG','SHORT'):continue
+  previous_score=max(float(previous.get('long_score') or 0),float(previous.get('short_score') or 0))
+  if previous_score==100 and previous.get('signal')==market.get('signal'):continue
+  candidates.append((symbol,market))
+ if not candidates:return
+ symbol,market=sorted(candidates,key=lambda x:x[0])[0]
+ r=await mexc_get(client,'https://api.mexc.com/api/v1/contract/detail',params={'symbol':symbol},timeout=15)
+ payload=r.json() if r.status_code==200 else {}
+ detail=_contract_detail(payload.get('data'),symbol) if payload.get('success') else None
+ if not detail or not detail.get('apiAllowed',True):
+  _live_fee_update(armed['id'],status='PREPARE_FAILED',error='Contract detail/API eligibility unavailable')
+  return
+ price=float((market.get('15m') or {}).get('price') or 0); contract_size=float(detail.get('contractSize') or 0)
+ min_vol=Decimal(str(detail.get('minVol') or 1)); vol_unit=Decimal(str(detail.get('volUnit') or 1))
+ contracts=(min_vol/vol_unit).to_integral_value(rounding=ROUND_CEILING)*vol_unit
+ leverage=max(1,int(detail.get('minLeverage') or 1)); notional=price*contract_size*float(contracts)
+ taker=max(float(detail.get('takerFeeRate') or 0),LIVE_FEE_TEST_ESTIMATED_TAKER_RATE)
+ estimated_fee=notional*taker; max_loss=notional*0.005+estimated_fee*2
+ now=datetime.now(); expires=now+timedelta(seconds=LIVE_FEE_TEST_EXPIRY_SECONDS)
+ _live_fee_update(armed['id'],status='PREPARED',candidate_at=now.isoformat(timespec='seconds'),
+  expires_at=expires.isoformat(timespec='seconds'),symbol=symbol,side=market['signal'],score=score,
+  reference_price=price,contract_size=contract_size,contracts=float(contracts),leverage=leverage,
+  estimated_taker_rate=taker,estimated_entry_fee=estimated_fee,estimated_exit_fee=estimated_fee,
+  max_estimated_loss=max_loss,error=None)
+ log(f'LIVE_FEE_TEST adayı hazır: {symbol} {market["signal"]} · gerçek emir DEVRE DIŞI','WARN')
+
+def _signed_headers(key,secret,timestamp,request_param):
+ signature=hmac.new(secret.encode(),(key+timestamp+request_param).encode(),hashlib.sha256).hexdigest()
+ return {'ApiKey':key,'Request-Time':timestamp,'Signature':signature,'Content-Type':'application/json'}
+
+async def mexc_private_request(client,method,path,params=None,body=None):
+ global mexc_last_request_at
+ key=credential_get('api_key'); secret=credential_get('api_secret')
+ if not key or not secret:raise RuntimeError('Private API credential yapılandırılmamış')
+ params=params or {}
+ async with mexc_request_lock:
+  wait=MEXC_MIN_REQUEST_INTERVAL-(time.monotonic()-mexc_last_request_at)
+  if wait>0:await asyncio.sleep(wait)
+  ts=str(int(time.time()*1000))
+  if method=='GET':
+   request_param=urlencode(sorted((k,str(v)) for k,v in params.items()))
+   response=await client.get('https://api.mexc.com'+path,params=params,headers=_signed_headers(key,secret,ts,request_param),timeout=15)
+  else:
+   request_param=json.dumps(body or {},separators=(',',':'),ensure_ascii=False)
+   response=await client.post('https://api.mexc.com'+path,content=request_param.encode(),headers=_signed_headers(key,secret,ts,request_param),timeout=15)
+  mexc_last_request_at=time.monotonic()
+ try:payload=response.json()
+ except Exception:raise RuntimeError(f'Private API geçersiz yanıt: HTTP {response.status_code}')
+ if response.status_code!=200 or payload.get('success') is not True:
+  detail=redact_credentials(payload.get('message') or payload.get('msg') or payload.get('code') or response.status_code,key,secret)
+  raise RuntimeError(f'Private API başarısız: {detail}')
+ return payload.get('data')
+
+async def _order_details(client,order_id):
+ for _ in range(20):
+  order=await mexc_private_request(client,'GET',f'/api/v1/private/order/get/{order_id}')
+  if int(order.get('state') or 0)==3 and float(order.get('dealVol') or 0)>0:return order
+  if int(order.get('state') or 0) in (4,5):raise RuntimeError('Order completed olmadan iptal/geçersiz duruma geçti')
+  await asyncio.sleep(.25)
+ raise RuntimeError('Order fill doğrulama zaman aşımı')
+
+async def _order_fills(client,order_id,contract_size):
+ deals=await mexc_private_request(client,'GET',f'/api/v1/private/order/deal_details/{order_id}') or []
+ if not deals:raise RuntimeError('Order trade/fill detayı bulunamadı')
+ vol=sum(float(x.get('vol') or 0) for x in deals); weighted=sum(float(x.get('price') or 0)*float(x.get('vol') or 0) for x in deals)
+ avg=weighted/vol if vol else 0; fee=sum(float(x.get('fee') or 0) for x in deals)
+ currencies=sorted({str(x.get('feeCurrency') or '') for x in deals})
+ return {'executed_contracts':vol,'executed_qty':vol*contract_size,'average_fill_price':avg,
+  'notional':avg*vol*contract_size,'actual_fee':fee,'fee_currency':','.join(currencies),
+  'trade_ids':[str(x.get('id')) for x in deals],'timestamps':[x.get('timestamp') for x in deals],
+  'is_taker':all(bool(x.get('isTaker',x.get('taker',False))) for x in deals)}
+
 def has_open(sym):
  c=db(); r=c.execute("SELECT 1 FROM positions WHERE status='OPEN' AND symbol=?",(sym,)).fetchone(); c.close(); return bool(r)
 def paper_open(sym,side,m,sc,regime_snapshot=None):
@@ -1063,6 +1170,9 @@ async def scan_once(force_universe=False):
     # Publish the full scanner snapshot at once so the UI doesn't watch 30 partial rows.
     state['market']=fresh_market
     state['public_api']='BAĞLI' if fresh_market else 'HATA'
+
+    # Research-only one-shot candidate capture. This path never submits an order.
+    await maybe_prepare_live_fee_test(client,fresh_market,previous_market,syms)
 
     # Open eligible PAPER trades only after all analysis tasks finish.
     for sym in syms:
@@ -1505,6 +1615,110 @@ async def private_test():
   state['private_api']='HATA'; raise HTTPException(400,f"MEXC yanıtı: HTTP {r.status_code} · {detail}")
  except HTTPException: raise
  except Exception as e: state['private_api']='HATA'; raise HTTPException(502,redact_credentials(e,key,secret))
+
+def _require_local(request):
+ host=request.client.host if request.client else ''
+ if host not in ('127.0.0.1','::1','localhost'):
+  raise HTTPException(403,'LIVE_FEE_TEST yalnız localhost üzerinden yönetilebilir.')
+
+@app.get('/api/live-fee-test/status')
+def live_fee_test_status():
+ c=db(); row=c.execute('SELECT * FROM live_fee_tests ORDER BY id DESC LIMIT 1').fetchone(); c.close()
+ if not row:return {'status':'DISARMED'}
+ data=dict(row)
+ for field in ('entry_fill_json','exit_fill_json','result_json'):
+  data[field[:-5] if field.endswith('_json') else field]=json.loads(data[field]) if data.get(field) else None
+  data.pop(field,None)
+ data['confirmation_required']=f"ONAY LIVE_FEE_TEST {data['id']} {data.get('symbol') or ''} {data.get('side') or ''}" if data['status']=='PREPARED' else None
+ return data
+
+@app.post('/api/live-fee-test/arm')
+def arm_live_fee_test(request:Request):
+ _require_local(request)
+ c=db(); completed=c.execute("SELECT 1 FROM live_fee_tests WHERE status='COMPLETED' LIMIT 1").fetchone(); c.close()
+ if completed:raise HTTPException(409,'Tek seferlik LIVE_FEE_TEST daha önce tamamlandı; yeniden kurulamaz.')
+ if _live_fee_row(('ARMED','PREPARED','EXECUTING','OPEN_ALARM')):
+  raise HTTPException(409,'Aktif veya alarm durumunda bir LIVE_FEE_TEST zaten var.')
+ now=datetime.now().isoformat(timespec='seconds')
+ def write(c):
+  cur=c.execute("INSERT INTO live_fee_tests(status,armed_at) VALUES('ARMED',?)",(now,)); return cur.lastrowid
+ test_id=_sqlite_write_with_retry(write)
+ log('LIVE_FEE_TEST yalnız aday beklemek üzere ARMED; gerçek emir DEVRE DIŞI','WARN')
+ return {'id':test_id,'status':'ARMED','orders_enabled':False}
+
+class LiveFeeExecute(BaseModel): confirmation:str
+
+@app.post('/api/live-fee-test/execute')
+async def execute_live_fee_test(body:LiveFeeExecute,request:Request):
+ _require_local(request)
+ async with live_fee_test_lock:
+  candidate=_live_fee_row(('PREPARED',))
+  if not candidate:raise HTTPException(409,'Onaya hazır LIVE_FEE_TEST adayı yok.')
+  expected=f"ONAY LIVE_FEE_TEST {candidate['id']} {candidate['symbol']} {candidate['side']}"
+  if not hmac.compare_digest(body.confirmation,expected):raise HTTPException(403,'Açık onay metni eşleşmiyor.')
+  if datetime.now()>datetime.fromisoformat(candidate['expires_at']):
+   _live_fee_update(candidate['id'],status='EXPIRED',error='Aday onay süresi doldu')
+   raise HTTPException(409,'Adayın onay süresi doldu; hiçbir emir gönderilmedi.')
+  market=(state.get('market') or {}).get(candidate['symbol']) or {}
+  score=max(float(market.get('long_score') or 0),float(market.get('short_score') or 0))
+  if score!=100 or market.get('signal')!=candidate['side']:
+   _live_fee_update(candidate['id'],status='STALE',error='Score=100 sinyali artık geçerli değil')
+   raise HTTPException(409,'Score=100 sinyali artık geçerli değil; hiçbir emir gönderilmedi.')
+  _live_fee_update(candidate['id'],status='EXECUTING',execution_started_at=datetime.now().isoformat(timespec='seconds'))
+  entry_submitted=False; entry_order_id=None
+  try:
+   async with httpx.AsyncClient(headers={'User-Agent':'MEXC-Futures-Live-Fee-Test/1.0'}) as client:
+    position_mode=await mexc_private_request(client,'GET','/api/v1/private/position/position_mode')
+    if int(position_mode or 0)!=2:raise RuntimeError('Reduce-only güvenliği için MEXC position mode ONE-WAY olmalı')
+    open_positions=await mexc_private_request(client,'GET','/api/v1/private/position/open_positions') or []
+    if any(float(x.get('holdVol') or 0)>0 for x in open_positions):raise RuntimeError('MEXC hesabında açık Futures pozisyonu var')
+    symbol=candidate['symbol']; side=candidate['side']; contracts=float(candidate['contracts']); leverage=int(candidate['leverage'])
+    external='live-fee-'+uuid.uuid4().hex
+    entry_payload={'symbol':symbol,'price':0,'vol':contracts,'leverage':leverage,
+     'side':1 if side=='LONG' else 3,'type':5,'openType':1,'positionMode':2,'externalOid':external}
+    entry_submitted=True
+    entry_order_id=str(await mexc_private_request(client,'POST','/api/v1/private/order/submit',body=entry_payload))
+    entry_order=await _order_details(client,entry_order_id)
+    entry_fill=await _order_fills(client,entry_order_id,float(candidate['contract_size']))
+    _live_fee_update(candidate['id'],entry_order_id=entry_order_id,entry_fill_json=json.dumps(entry_fill,separators=(',',':')))
+    position_id=entry_order.get('positionId')
+    exit_reference=float(((state.get('market') or {}).get(symbol) or {}).get('price') or entry_fill['average_fill_price'])
+    exit_payload={'symbol':symbol,'price':0,'vol':entry_fill['executed_contracts'],'leverage':leverage,
+     'side':4 if side=='LONG' else 2,'type':5,'openType':1,'positionMode':2,'reduceOnly':True,
+     'positionId':position_id,'externalOid':'live-fee-'+uuid.uuid4().hex}
+    exit_order_id=None; close_error=None
+    for _ in range(3):
+     try:
+      exit_order_id=str(await mexc_private_request(client,'POST','/api/v1/private/order/submit',body=exit_payload)); close_error=None; break
+     except Exception as e:
+      close_error=e; await asyncio.sleep(.25)
+    if exit_order_id is None:raise RuntimeError(f'KRİTİK: LIVE pozisyon kapanmadı: {close_error}')
+    exit_order=await _order_details(client,exit_order_id)
+    exit_fill=await _order_fills(client,exit_order_id,float(candidate['contract_size']))
+    funding_data=await mexc_private_request(client,'GET','/api/v1/private/position/funding_records',params={
+     'symbol':symbol,'position_id':position_id,'page_num':1,'page_size':100})
+    funding_rows=(funding_data or {}).get('resultList') or []; funding=sum(float(x.get('funding') or 0) for x in funding_rows)
+    sign=1 if side=='LONG' else -1
+    gross=(exit_fill['average_fill_price']-entry_fill['average_fill_price'])*sign*entry_fill['executed_qty']
+    actual_fee=entry_fill['actual_fee']+exit_fill['actual_fee']; net=gross+funding-actual_fee
+    paper_fee=(entry_fill['notional']+exit_fill['notional'])*float(settings.get('paper_fee_rate',.0008))
+    reference=float(candidate['reference_price']); entry_slippage=(entry_fill['average_fill_price']-reference)*sign/(reference or 1)*10000
+    exit_slippage=(exit_reference-exit_fill['average_fill_price'])*sign/(exit_reference or 1)*10000
+    result={'entry':entry_fill,'exit':exit_fill,'entry_slippage_bps':entry_slippage,'exit_slippage_bps':exit_slippage,
+     'gross_price_pnl':gross,'funding':funding,'net_realized_pnl':net,'paper_fee':paper_fee,
+     'actual_fee':actual_fee,'actual_minus_paper_fee':actual_fee-paper_fee,'position_id':position_id}
+    _live_fee_update(candidate['id'],status='COMPLETED',exit_order_id=exit_order_id,
+     exit_fill_json=json.dumps(exit_fill,separators=(',',':')),funding=funding,
+     result_json=json.dumps(result,separators=(',',':')),completed_at=datetime.now().isoformat(timespec='seconds'),error=None)
+    log(f'LIVE_FEE_TEST tamamlandı: {symbol} · tek kullanımlık mod DISARMED','WARN')
+    return {'id':candidate['id'],'status':'COMPLETED','result':result}
+  except Exception as e:
+   key=credential_get('api_key'); secret=credential_get('api_secret'); safe=redact_credentials(e,key,secret)
+   alarm=entry_submitted
+   _live_fee_update(candidate['id'],status='OPEN_ALARM' if alarm else 'PREFLIGHT_FAILED',
+    entry_order_id=entry_order_id,error=safe,completed_at=datetime.now().isoformat(timespec='seconds'))
+   log(('KRİTİK LIVE_FEE_TEST AÇIK POZİSYON RİSKİ: ' if alarm else 'LIVE_FEE_TEST emir öncesi durdu: ')+safe,'ERROR')
+   raise HTTPException(502,('AÇIK LIVE POZİSYON ALARMI: ' if alarm else 'Emir gönderilmedi: ')+safe)
 class Settings(BaseModel):
  paper_balance:float;risk_per_trade_usd:float;top_volume_count:int;universe_refresh_minutes:int;max_alt_notional_usd:float;max_btc_notional_usd:float;max_total_open_risk_usd:float;daily_loss_limit_usd:float;leverage:int;signal_threshold:int;scan_seconds:int;stop_atr_mult:float;tp1_r:float;tp1_pct:float;tp2_r:float;tp2_pct:float;runner_pct:float;move_be_at_r:float
 
