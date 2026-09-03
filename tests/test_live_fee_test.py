@@ -292,17 +292,55 @@ def test_execute_uses_isolated_minimum_and_reduce_only_then_disarms(
     connection.close()
 
 
+def test_execute_blocks_any_existing_position_on_candidate_symbol(
+    isolated_app, monkeypatch
+):
+    module, _ = isolated_app
+    test_id = prepared_candidate(module)
+    posts = []
+
+    async def private(client, method, path, params=None, body=None):
+        if path.endswith("position_mode"):
+            return 1
+        if path.endswith("open_positions"):
+            return [
+                {"positionId": "btc-short", "symbol": "BTC_USDT", "positionType": 2, "holdVol": 1},
+                {"positionId": "other-long", "symbol": "USELESS_USDT", "positionType": 1, "holdVol": 2},
+            ]
+        if method == "POST":
+            posts.append(body)
+        raise AssertionError(path)
+
+    monkeypatch.setattr(module.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(module, "mexc_private_request", private)
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            module.execute_live_fee_test(
+                module.LiveFeeExecute(
+                    confirmation=f"ONAY LIVE_FEE_TEST {test_id} BTC_USDT LONG"
+                ),
+                LocalRequest(),
+            )
+        )
+
+    assert "BTC_USDT üzerinde açık gerçek LONG/SHORT" in exc.value.detail
+    assert posts == []
+    assert module._live_fee_row(("PREFLIGHT_FAILED",))["id"] == test_id
+
+
 def test_execute_hedge_mode_closes_only_fetched_position_and_partial_fill(
     isolated_app, monkeypatch
 ):
     module, _ = isolated_app
     test_id = prepared_candidate(module)
     calls = []
+    unrelated = {"positionId": "other-short", "symbol": "USELESS_USDT", "positionType": 2, "holdVol": 3}
     position_checks = iter(
         [
-            [],
-            [{"positionId": "hedge-long-1", "symbol": "BTC_USDT", "positionType": 1, "holdVol": 0.4}],
-            [],
+            [unrelated],
+            [unrelated, {"positionId": "hedge-long-1", "symbol": "BTC_USDT", "positionType": 1, "holdVol": 0.4}],
+            [unrelated],
         ]
     )
 

@@ -767,10 +767,11 @@ async def _live_fee_position_after_entry(client,symbol,side):
  for _ in range(20):
   positions=_active_contract_positions(
    await mexc_private_request(client,'GET','/api/v1/private/position/open_positions') or [])
-  if not positions:
+  symbol_positions=[x for x in positions if str(x.get('symbol'))==symbol]
+  if not symbol_positions:
    await asyncio.sleep(.25); continue
-  matches=[x for x in positions if str(x.get('symbol'))==symbol and int(x.get('positionType') or 0)==expected_type]
-  if len(positions)!=1 or len(matches)!=1:
+  matches=[x for x in symbol_positions if int(x.get('positionType') or 0)==expected_type]
+  if len(symbol_positions)!=1 or len(matches)!=1:
    raise RuntimeError('KRİTİK: Entry sonrası tek ve beklenen yönde HEDGE pozisyonu doğrulanamadı')
   position=matches[0]
   if not position.get('positionId'):
@@ -778,15 +779,16 @@ async def _live_fee_position_after_entry(client,symbol,side):
   return position
  raise RuntimeError('KRİTİK: Entry sonrası gerçek HEDGE pozisyonu sorgulanamadı')
 
-async def _assert_live_fee_position_closed(client,position_id):
+async def _assert_live_fee_position_closed(client,symbol,position_id):
  remaining=None
  for _ in range(20):
   positions=_active_contract_positions(
    await mexc_private_request(client,'GET','/api/v1/private/position/open_positions') or [])
-  unexpected=[x for x in positions if str(x.get('positionId'))!=str(position_id)]
+  symbol_positions=[x for x in positions if str(x.get('symbol'))==symbol]
+  unexpected=[x for x in symbol_positions if str(x.get('positionId'))!=str(position_id)]
   if unexpected:
    raise RuntimeError('KRİTİK: Exit sonrası beklenmeyen karşıt/açık HEDGE pozisyonu tespit edildi')
-  remaining=next((x for x in positions if str(x.get('positionId'))==str(position_id)),None)
+  remaining=next((x for x in symbol_positions if str(x.get('positionId'))==str(position_id)),None)
   if not remaining:return
   await asyncio.sleep(.25)
  raise RuntimeError(f"KRİTİK: Exit sonrası positionId {position_id} üzerinde {remaining.get('holdVol')} contract kaldı")
@@ -1738,9 +1740,11 @@ async def execute_live_fee_test(body:LiveFeeExecute,request:Request):
    async with httpx.AsyncClient(headers={'User-Agent':'MEXC-Futures-Live-Fee-Test/1.0'}) as client:
     position_mode=int(await mexc_private_request(client,'GET','/api/v1/private/position/position_mode') or 0)
     if position_mode not in (1,2):raise RuntimeError(f'Desteklenmeyen MEXC position mode: {position_mode}')
-    open_positions=await mexc_private_request(client,'GET','/api/v1/private/position/open_positions') or []
-    if any(float(x.get('holdVol') or 0)>0 for x in open_positions):raise RuntimeError('MEXC hesabında açık Futures pozisyonu var')
     symbol=candidate['symbol']; side=candidate['side']; contracts=float(candidate['contracts']); leverage=int(candidate['leverage'])
+    open_positions=_active_contract_positions(
+     await mexc_private_request(client,'GET','/api/v1/private/position/open_positions') or [])
+    if any(str(x.get('symbol'))==symbol for x in open_positions):
+     raise RuntimeError(f'{symbol} üzerinde açık gerçek LONG/SHORT Futures pozisyonu var')
     external='live-fee-'+uuid.uuid4().hex
     entry_payload={'symbol':symbol,'price':0,'vol':contracts,'leverage':leverage,
      'side':1 if side=='LONG' else 3,'type':5,'openType':1,'positionMode':position_mode,'externalOid':external}
@@ -1767,7 +1771,7 @@ async def execute_live_fee_test(body:LiveFeeExecute,request:Request):
     exit_fill=await _order_fills(client,exit_order_id,float(candidate['contract_size']))
     if float(exit_fill['executed_contracts'])-close_contracts>1e-12:
      raise RuntimeError('KRİTİK: Exit fill miktarı doğrulanmış entry miktarını aştı')
-    await _assert_live_fee_position_closed(client,position_id)
+    await _assert_live_fee_position_closed(client,symbol,position_id)
     funding_data=await mexc_private_request(client,'GET','/api/v1/private/position/funding_records',params={
      'symbol':symbol,'position_id':position_id,'page_num':1,'page_size':100})
     funding_rows=(funding_data or {}).get('resultList') or []; funding=sum(float(x.get('funding') or 0) for x in funding_rows)
