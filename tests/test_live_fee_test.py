@@ -20,6 +20,29 @@ class FakeAsyncClient:
         return False
 
 
+class FakePublicResponse:
+    status_code = 200
+
+    def json(self):
+        return {
+            "success": True,
+            "data": [
+                {"symbol": "AAA_USDT", "apiAllowed": False, "state": 0},
+                {
+                    "symbol": "ZZZ_USDT",
+                    "apiAllowed": True,
+                    "state": 0,
+                    "settleCoin": "USDT",
+                    "contractSize": 0.01,
+                    "minVol": 1,
+                    "volUnit": 1,
+                    "minLeverage": 1,
+                    "takerFeeRate": 0.0004,
+                },
+            ],
+        }
+
+
 def prepared_candidate(module):
     now = module.datetime.now()
     connection = module.db()
@@ -83,6 +106,30 @@ def test_cancel_only_disarms_non_executing_test(isolated_app):
     with pytest.raises(HTTPException) as exc:
         module.cancel_live_fee_test(LocalRequest())
     assert exc.value.status_code == 409
+
+
+def test_prepare_uses_first_liquid_eligible_symbol_without_score_gate(isolated_app, monkeypatch):
+    module, _ = isolated_app
+    module.arm_live_fee_test(LocalRequest())
+
+    async def public(*args, **kwargs):
+        assert "params" not in kwargs
+        return FakePublicResponse()
+
+    monkeypatch.setattr(module, "mexc_get", public)
+    markets = {
+        "AAA_USDT": {"15m": {"price": 5, "trend": 1}, "long_score": 99},
+        "ZZZ_USDT": {"15m": {"price": 10, "trend": -1}, "short_score": 42},
+    }
+
+    asyncio.run(module.maybe_prepare_live_fee_test(None, markets, {}, ["AAA_USDT", "ZZZ_USDT"]))
+
+    candidate = module._live_fee_row(("PREPARED",))
+    assert candidate["symbol"] == "ZZZ_USDT"
+    assert candidate["side"] == "SHORT"
+    assert candidate["score"] == 42
+    assert candidate["contracts"] == 1
+    assert candidate["reference_price"] == 10
 
 
 def test_execute_requires_exact_explicit_confirmation(isolated_app, monkeypatch):

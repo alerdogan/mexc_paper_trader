@@ -660,35 +660,39 @@ def _contract_detail(data,symbol):
 async def maybe_prepare_live_fee_test(client,current_market,previous_market,universe_symbols):
  armed=_live_fee_row(('ARMED',))
  if not armed:return
- candidates=[]
- for symbol in universe_symbols:
-  market=current_market.get(symbol) or {}; previous=previous_market.get(symbol) or {}
-  score=max(float(market.get('long_score') or 0),float(market.get('short_score') or 0))
-  if score!=100 or market.get('signal') not in ('LONG','SHORT'):continue
-  previous_score=max(float(previous.get('long_score') or 0),float(previous.get('short_score') or 0))
-  if previous_score==100 and previous.get('signal')==market.get('signal'):continue
-  candidates.append((symbol,market))
+ candidates=[(symbol,current_market.get(symbol) or {}) for symbol in universe_symbols
+  if float(((current_market.get(symbol) or {}).get('15m') or {}).get('price') or 0)>0]
  if not candidates:return
- symbol,market=sorted(candidates,key=lambda x:x[0])[0]
- r=await mexc_get(client,'https://api.mexc.com/api/v1/contract/detail',params={'symbol':symbol},timeout=15)
+ r=await mexc_get(client,'https://api.mexc.com/api/v1/contract/detail',timeout=15)
  payload=r.json() if r.status_code==200 else {}
- detail=_contract_detail(payload.get('data'),symbol) if payload.get('success') else None
- if not detail or not detail.get('apiAllowed',True):
-  _live_fee_update(armed['id'],status='PREPARE_FAILED',error='Contract detail/API eligibility unavailable')
+ details=payload.get('data') if payload.get('success') else []
+ selected=None
+ for symbol,market in candidates:
+  detail=_contract_detail(details,symbol)
+  if not detail or not detail.get('apiAllowed',True):continue
+  if detail.get('state') not in (None,0):continue
+  if detail.get('settleCoin') not in (None,'USDT'):continue
+  if float(detail.get('contractSize') or 0)<=0 or float(detail.get('minVol') or 0)<=0 or float(detail.get('volUnit') or 0)<=0:continue
+  selected=(symbol,market,detail); break
+ if not selected:
+  _live_fee_update(armed['id'],error='Likit evrende API ile işleme uygun contract bulunamadı')
   return
+ symbol,market,detail=selected
  price=float((market.get('15m') or {}).get('price') or 0); contract_size=float(detail.get('contractSize') or 0)
  min_vol=Decimal(str(detail.get('minVol') or 1)); vol_unit=Decimal(str(detail.get('volUnit') or 1))
  contracts=(min_vol/vol_unit).to_integral_value(rounding=ROUND_CEILING)*vol_unit
  leverage=max(1,int(detail.get('minLeverage') or 1)); notional=price*contract_size*float(contracts)
  taker=max(float(detail.get('takerFeeRate') or 0),LIVE_FEE_TEST_ESTIMATED_TAKER_RATE)
  estimated_fee=notional*taker; max_loss=notional*0.005+estimated_fee*2
+ side=market.get('signal') if market.get('signal') in ('LONG','SHORT') else ('SHORT' if (market.get('15m') or {}).get('trend')==-1 else 'LONG')
+ score=max(float(market.get('long_score') or 0),float(market.get('short_score') or 0))
  now=datetime.now(); expires=now+timedelta(seconds=LIVE_FEE_TEST_EXPIRY_SECONDS)
  _live_fee_update(armed['id'],status='PREPARED',candidate_at=now.isoformat(timespec='seconds'),
-  expires_at=expires.isoformat(timespec='seconds'),symbol=symbol,side=market['signal'],score=score,
+  expires_at=expires.isoformat(timespec='seconds'),symbol=symbol,side=side,score=score,
   reference_price=price,contract_size=contract_size,contracts=float(contracts),leverage=leverage,
   estimated_taker_rate=taker,estimated_entry_fee=estimated_fee,estimated_exit_fee=estimated_fee,
   max_estimated_loss=max_loss,error=None)
- log(f'LIVE_FEE_TEST adayı hazır: {symbol} {market["signal"]} · gerçek emir DEVRE DIŞI','WARN')
+ log(f'LIVE_FEE_TEST adayı hazır: {symbol} {side} · gerçek emir DEVRE DIŞI','WARN')
 
 def _signed_headers(key,secret,timestamp,request_param):
  signature=hmac.new(secret.encode(),(key+timestamp+request_param).encode(),hashlib.sha256).hexdigest()
@@ -1673,10 +1677,9 @@ async def execute_live_fee_test(body:LiveFeeExecute,request:Request):
    _live_fee_update(candidate['id'],status='EXPIRED',error='Aday onay süresi doldu')
    raise HTTPException(409,'Adayın onay süresi doldu; hiçbir emir gönderilmedi.')
   market=(state.get('market') or {}).get(candidate['symbol']) or {}
-  score=max(float(market.get('long_score') or 0),float(market.get('short_score') or 0))
-  if score!=100 or market.get('signal')!=candidate['side']:
-   _live_fee_update(candidate['id'],status='STALE',error='Score=100 sinyali artık geçerli değil')
-   raise HTTPException(409,'Score=100 sinyali artık geçerli değil; hiçbir emir gönderilmedi.')
+  if float(((market.get('15m') or {}).get('price') or market.get('price') or 0))<=0:
+   _live_fee_update(candidate['id'],status='STALE',error='Sembol için güncel referans fiyatı yok')
+   raise HTTPException(409,'Sembol için güncel referans fiyatı yok; hiçbir emir gönderilmedi.')
   _live_fee_update(candidate['id'],status='EXECUTING',execution_started_at=datetime.now().isoformat(timespec='seconds'))
   entry_submitted=False; entry_order_id=None
   try:

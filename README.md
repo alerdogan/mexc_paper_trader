@@ -205,8 +205,8 @@ Top-30 havuzu yalnızca MEXC Spot tarafında gerçek USDT kripto çifti bulunan 
 
 ## Kontrollü LIVE fee doğrulaması
 - Ana uygulama ve scanner daima PAPER kalır. Normal tarama kodu hiçbir LIVE emir göndermez.
-- `LIVE_FEE_TEST`, yalnız localhost'tan açıkça arm edilen, arm işleminden sonra oluşan yeni bir score=100 sinyali yakalayan ve ikinci bir birebir onay metni olmadan emir gönderemeyen tek kullanımlık akıştır.
-- Aday; contract minimum volume, minimum leverage, isolated margin ve tahmini iki yönlü taker fee/maksimum tahmini kayıp ile hazırlanır. Onay 10 dakika içinde verilmez veya sinyal score=100 niteliğini kaybederse emir gönderilmez.
+- `LIVE_FEE_TEST`, yalnız localhost'tan açıkça arm edilen, likidite sıralı tarama evrenindeki ilk API-uyumlu sembolü seçen ve ikinci bir birebir onay metni olmadan emir gönderemeyen tek kullanımlık fee doğrulama akışıdır; score veya strateji sinyali adaylık şartı değildir.
+- Aday; contract minimum volume, minimum leverage, isolated margin ve tahmini iki yönlü taker fee/maksimum tahmini kayıp ile hazırlanır. Onay 10 dakika içinde verilmez veya sembolün güncel referans fiyatı kaybolursa emir gönderilmez.
 - Execute öncesi MEXC hesabında açık Futures pozisyonu olmadığı ve one-way position mode doğrulanır. Giriş market/taker; çıkış aynı miktarda `reduceOnly` market/taker emridir.
 - Fill/trade ID, gerçekleşen contract ve coin miktarı, ortalama fiyat, fee/currency, timestamp, funding, slippage, gross/net PnL ve PAPER fee karşılaştırması ayrı `live_fee_tests` tablosunda tutulur; PAPER pozisyonları ve Strategy Lab kayıtları kullanılmaz.
 - Entry submit sonrasında herhangi bir belirsizlik veya kapanış hatası `OPEN_ALARM` olarak kalıcı kaydedilir ve hata loguna açık alarm yazılır.
