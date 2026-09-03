@@ -112,6 +112,31 @@ def test_live_fee_audit_is_local_and_read_only(isolated_app, monkeypatch):
     assert all(method == "GET" and body is None for method, _, body in calls)
 
 
+def test_clean_recent_audit_allows_rearm_without_changing_open_alarm(isolated_app):
+    module, _ = isolated_app
+    connection = module.db()
+    cursor = connection.execute(
+        """INSERT INTO live_fee_tests(status,armed_at,symbol,side,error)
+        VALUES('OPEN_ALARM','2026-01-01T00:00:00','BTC_USDT','LONG','manual review')"""
+    )
+    alarm_id = cursor.lastrowid
+    connection.commit()
+    connection.close()
+    module.state["live_fee_audit"] = {
+        "symbol": "BTC_USDT",
+        "checked_at": module.datetime.now().isoformat(timespec="seconds"),
+        "open_position_count": 0,
+        "open_order_count": 0,
+    }
+
+    result = module.arm_live_fee_test(LocalRequest())
+
+    assert result["status"] == "ARMED"
+    alarm = module._live_fee_row(("OPEN_ALARM",))
+    assert alarm["id"] == alarm_id
+    assert alarm["error"] == "manual review"
+
+
 def test_cancel_only_disarms_non_executing_test(isolated_app):
     module, _ = isolated_app
     module.arm_live_fee_test(LocalRequest())

@@ -13,7 +13,7 @@ from pydantic import BaseModel
 BASE=Path(__file__).parent; DB=BASE/'trader.db'; app=FastAPI(title='MEXC Futures Paper Trader'); templates=Jinja2Templates(directory=str(BASE/'templates'))
 SERVICE_STARTED_MONOTONIC=time.monotonic()
 DEFAULTS={"symbols":["BTC_USDT"],"top_volume_count":30,"universe_refresh_minutes":15,"paper_balance":4000.0,"risk_per_trade_usd":20.0,"max_alt_notional_usd":5000.0,"max_btc_notional_usd":10000.0,"max_total_open_risk_usd":100.0,"daily_loss_limit_usd":300.0,"leverage":2,"signal_threshold":80,"scan_seconds":30,"stop_atr_mult":1.5,"tp1_r":1.0,"tp1_pct":30.0,"tp2_r":2.0,"tp2_pct":30.0,"runner_pct":40.0,"move_be_at_r":1.0,"min_free_balance_pct":20.0,"paper_fee_rate":0.0008}
-settings=DEFAULTS.copy(); state={"running":False,"panic":False,"entry_paused":False,"last_scan":None,"market":{},"live_prices":{},"last_price_update":None,"scanning":False,"error":None,"feed":"MEXC FUTURES","public_api":None,"api_saved":False,"private_api":None,"paper_test_threshold":None,"universe":[],"universe_updated":None,"scan_duration_sec":None,"rate_limit_wait":None,"live_fee_position_check":None}
+settings=DEFAULTS.copy(); state={"running":False,"panic":False,"entry_paused":False,"last_scan":None,"market":{},"live_prices":{},"last_price_update":None,"scanning":False,"error":None,"feed":"MEXC FUTURES","public_api":None,"api_saved":False,"private_api":None,"paper_test_threshold":None,"universe":[],"universe_updated":None,"scan_duration_sec":None,"rate_limit_wait":None,"live_fee_position_check":None,"live_fee_audit":None}
 TASK_NAMES=('scanner','position_engine','ghost_analyzer')
 STRATEGY_LAB_MODELS=('CURRENT','NO_STOP_MINI','SMART_EXIT','TRAILING_RUNNER')
 STRATEGY_LAB_VERSION='1.0'
@@ -1709,9 +1709,12 @@ async def live_fee_test_audit(request:Request):
     await mexc_private_request(client,'GET','/api/v1/private/position/open_positions') or [])
    symbol_positions=[x for x in positions if str(x.get('symbol'))==symbol]
    orders=await mexc_private_request(client,'GET',f'/api/v1/private/order/list/open_orders/{symbol}') or []
-  return {'symbol':symbol,'open_position_count':len(symbol_positions),'open_order_count':len(orders),
+  result={'symbol':symbol,'checked_at':datetime.now().isoformat(timespec='seconds'),
+   'open_position_count':len(symbol_positions),'open_order_count':len(orders),
    'positions':[{'position_id':str(x.get('positionId')),'position_type':x.get('positionType'),
     'hold_vol':x.get('holdVol')} for x in symbol_positions]}
+  state['live_fee_audit']=result
+  return result
  except Exception as e:
   raise HTTPException(502,redact_credentials(e,credential_get('api_key'),credential_get('api_secret')))
 
@@ -1720,8 +1723,15 @@ def arm_live_fee_test(request:Request):
  _require_local(request)
  c=db(); completed=c.execute("SELECT 1 FROM live_fee_tests WHERE status='COMPLETED' LIMIT 1").fetchone(); c.close()
  if completed:raise HTTPException(409,'Tek seferlik LIVE_FEE_TEST daha önce tamamlandı; yeniden kurulamaz.')
- if _live_fee_row(('ARMED','PREPARED','EXECUTING','OPEN_ALARM')):
+ if _live_fee_row(('ARMED','PREPARED','EXECUTING')):
   raise HTTPException(409,'Aktif veya alarm durumunda bir LIVE_FEE_TEST zaten var.')
+ alarm=_live_fee_row(('OPEN_ALARM',)); audit=state.get('live_fee_audit') or {}
+ audit_at=datetime.fromisoformat(audit['checked_at']) if audit.get('checked_at') else None
+ audit_clear=bool(alarm and audit_at and datetime.now()-audit_at<=timedelta(minutes=2)
+  and audit.get('symbol')==alarm.get('symbol') and audit.get('open_position_count')==0
+  and audit.get('open_order_count')==0)
+ if alarm and not audit_clear:
+  raise HTTPException(409,'OPEN_ALARM için aynı sembolde taze ve temiz read-only audit gerekli.')
  now=datetime.now().isoformat(timespec='seconds')
  def write(c):
   cur=c.execute("INSERT INTO live_fee_tests(status,armed_at) VALUES('ARMED',?)",(now,)); return cur.lastrowid
