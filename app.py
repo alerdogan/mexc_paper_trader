@@ -17,6 +17,7 @@ TASK_NAMES=('scanner','position_engine','ghost_analyzer')
 STRATEGY_LAB_MODELS=('CURRENT','NO_STOP_MINI','SMART_EXIT','TRAILING_RUNNER')
 STRATEGY_LAB_VERSION='1.0'
 SCORE_SNAPSHOT_VERSION='1.0'
+MARKET_REGIME_SNAPSHOT_VERSION='1.0'
 SUPERVISOR_BACKOFF=(1,2,5,10,30)
 background_tasks={}
 
@@ -99,6 +100,20 @@ def init_db():
   fibonacci_near INTEGER,fibonacci_level REAL,fibonacci_distance REAL,fibonacci_distance_pct REAL,
   trend_15m INTEGER,trend_1h INTEGER,trend_4h INTEGER,score_details_json TEXT,
   FOREIGN KEY(position_id) REFERENCES positions(id)
+ )''')
+ c.execute('''CREATE TABLE IF NOT EXISTS market_regime_snapshots(
+  source_position_id INTEGER PRIMARY KEY,snapshot_version TEXT NOT NULL,captured_at TEXT NOT NULL,
+  regime_classification TEXT NOT NULL,position_side TEXT NOT NULL,market_alignment TEXT NOT NULL,
+  universe_size INTEGER NOT NULL,bullish_count INTEGER NOT NULL,bearish_count INTEGER NOT NULL,
+  neutral_count INTEGER NOT NULL,bullish_pct REAL NOT NULL,bearish_pct REAL NOT NULL,
+  trend_changed_15m_count INTEGER,trend_changed_15m_denominator INTEGER,trend_changed_15m_pct REAL,
+  btc_trend_15m INTEGER,btc_trend_1h INTEGER,btc_trend_4h INTEGER,
+  eth_trend_15m INTEGER,eth_trend_1h INTEGER,eth_trend_4h INTEGER,
+  btc_15m_price REAL,btc_15m_ema20 REAL,btc_15m_ema50 REAL,btc_15m_momentum TEXT,
+  btc_15m_rsi REAL,btc_15m_volume_ratio REAL,
+  eth_15m_price REAL,eth_15m_ema20 REAL,eth_15m_ema50 REAL,eth_15m_momentum TEXT,
+  eth_15m_rsi REAL,eth_15m_volume_ratio REAL,
+  FOREIGN KEY(source_position_id) REFERENCES positions(id)
  )''')
  # Existing open positions can only be tracked accurately from this upgrade forward.
  now_iso=datetime.now().isoformat(timespec='seconds')
@@ -542,9 +557,81 @@ def _insert_score_snapshot(c,position_id,snapshot):
   (position_id,*snapshot.values())
  )
 
+def _trend_majority(market):
+ trends=[int((market.get(tf) or {}).get('trend') or 0) for tf in ('15m','1h','4h')]
+ total=sum(trends)
+ return 1 if total>=2 else (-1 if total<=-2 else 0)
+
+def _ema_momentum(market):
+ m15=market.get('15m') or {}
+ price=float(m15.get('price') or 0); ema20=float(m15.get('ema20') or 0); ema50=float(m15.get('ema50') or 0)
+ if price>ema20>ema50:
+  return 'BULLISH_STACK'
+ if price<ema20<ema50:
+  return 'BEARISH_STACK'
+ return 'MIXED'
+
+def market_regime_snapshot(current_market,previous_market,universe_symbols,position_side,captured_at):
+ universe=[current_market[s] for s in universe_symbols if s in current_market]
+ trends=[int((m.get('15m') or {}).get('trend') or 0) for m in universe]
+ bullish=sum(t==1 for t in trends); bearish=sum(t==-1 for t in trends); neutral=len(trends)-bullish-bearish
+ size=len(trends); bullish_pct=bullish/(size or 1)*100; bearish_pct=bearish/(size or 1)*100
+ comparable=[]
+ for symbol in universe_symbols:
+  current=current_market.get(symbol); previous=previous_market.get(symbol)
+  if current and previous:
+   comparable.append((int((previous.get('15m') or {}).get('trend') or 0),int((current.get('15m') or {}).get('trend') or 0)))
+ changed=sum(before!=after for before,after in comparable)
+ changed_denominator=len(comparable)
+ changed_pct=changed/changed_denominator*100 if changed_denominator else None
+ btc=current_market.get('BTC_USDT') or {}; eth=current_market.get('ETH_USDT') or {}
+ btc_majority=_trend_majority(btc); eth_majority=_trend_majority(eth)
+ def short_term_reversal(market):
+  t15=int((market.get('15m') or {}).get('trend') or 0)
+  t1=int((market.get('1h') or {}).get('trend') or 0)
+  t4=int((market.get('4h') or {}).get('trend') or 0)
+  return t1==t4 and t1!=0 and t15==-t1
+ breadth_conflict=(btc_majority==eth_majority==1 and bearish_pct>=60) or (btc_majority==eth_majority==-1 and bullish_pct>=60)
+ reversal_risk=(changed_pct is not None and changed_pct>=30) or (short_term_reversal(btc) and short_term_reversal(eth)) or breadth_conflict
+ if reversal_risk:
+  regime='REVERSAL_RISK'
+ elif btc_majority==eth_majority==1 and bullish_pct>=60:
+  regime='BULLISH'
+ elif btc_majority==eth_majority==-1 and bearish_pct>=60:
+  regime='BEARISH'
+ else:
+  regime='MIXED'
+ aligned=(position_side=='LONG' and regime=='BULLISH') or (position_side=='SHORT' and regime=='BEARISH')
+ conflict=(position_side=='LONG' and regime=='BEARISH') or (position_side=='SHORT' and regime=='BULLISH')
+ alignment='ALIGNED' if aligned else ('CONFLICT' if conflict else 'UNCERTAIN')
+ def anchor_values(market,prefix):
+  m15=market.get('15m') or {}
+  return {
+   f'{prefix}_trend_15m':m15.get('trend'),f'{prefix}_trend_1h':(market.get('1h') or {}).get('trend'),
+   f'{prefix}_trend_4h':(market.get('4h') or {}).get('trend'),f'{prefix}_15m_price':m15.get('price'),
+   f'{prefix}_15m_ema20':m15.get('ema20'),f'{prefix}_15m_ema50':m15.get('ema50'),
+   f'{prefix}_15m_momentum':_ema_momentum(market),f'{prefix}_15m_rsi':m15.get('rsi'),
+   f'{prefix}_15m_volume_ratio':m15.get('volume_ratio'),
+  }
+ return {
+  'snapshot_version':MARKET_REGIME_SNAPSHOT_VERSION,'captured_at':captured_at,
+  'regime_classification':regime,'position_side':position_side,'market_alignment':alignment,
+  'universe_size':size,'bullish_count':bullish,'bearish_count':bearish,'neutral_count':neutral,
+  'bullish_pct':bullish_pct,'bearish_pct':bearish_pct,'trend_changed_15m_count':changed if changed_denominator else None,
+  'trend_changed_15m_denominator':changed_denominator if changed_denominator else None,'trend_changed_15m_pct':changed_pct,
+  **anchor_values(btc,'btc'),**anchor_values(eth,'eth'),
+ }
+
+def _insert_market_regime_snapshot(c,position_id,snapshot):
+ columns=['source_position_id',*snapshot.keys()]
+ c.execute(
+  f"INSERT INTO market_regime_snapshots ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+  (position_id,*snapshot.values())
+ )
+
 def has_open(sym):
  c=db(); r=c.execute("SELECT 1 FROM positions WHERE status='OPEN' AND symbol=?",(sym,)).fetchone(); c.close(); return bool(r)
-def paper_open(sym,side,m,sc):
+def paper_open(sym,side,m,sc,regime_snapshot=None):
  if state.get('entry_paused'):
   return
  if has_open(sym):
@@ -575,9 +662,16 @@ def paper_open(sym,side,m,sc):
  entry_fee=p*qty*fee_rate
  opened=datetime.now().isoformat(timespec='seconds')
  snapshot=score_snapshot(m,side,sc,opened)
+ if regime_snapshot is None:
+  cached_market=state.get('market') or {}
+  cached_universe=[x.get('symbol') for x in (state.get('universe') or []) if x.get('symbol')]
+  regime_snapshot=market_regime_snapshot(cached_market,{},cached_universe or list(cached_market),side,opened)
+ else:
+  regime_snapshot={**regime_snapshot,'captured_at':opened}
  def write(c):
   cur=c.execute('''INSERT INTO positions(symbol,side,status,entry,stop,initial_stop,qty,remaining_qty,risk_usd,score,opened_at,pnl,fee_paid,mae_r,mfe_r,tracking_started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(sym,side,'OPEN',p,stop,stop,qty,qty,actual,sc,opened,-entry_fee,entry_fee,0.0,0.0,opened))
   _insert_score_snapshot(c,cur.lastrowid,snapshot)
+  _insert_market_regime_snapshot(c,cur.lastrowid,regime_snapshot)
   return cur.lastrowid
  position_id=_sqlite_write_with_retry(write)
  try:
@@ -954,7 +1048,9 @@ async def scan_once(force_universe=False):
      log(state['error'],'ERROR')
      syms=settings.get('symbols',['BTC_USDT'])
 
-    results=await asyncio.gather(*(analyze_symbol(client,sym) for sym in syms))
+    previous_market=state.get('market') or {}
+    analysis_syms=list(dict.fromkeys([*syms,'BTC_USDT','ETH_USDT']))
+    results=await asyncio.gather(*(analyze_symbol(client,sym) for sym in analysis_syms))
     fresh_market={}
     for sym,m,err in results:
      if err:
@@ -972,7 +1068,9 @@ async def scan_once(force_universe=False):
     for sym in syms:
      m=fresh_market.get(sym)
      if m and m['signal']!='BEKLE':
-      paper_open(sym,m['signal'],m,max(m['long_score'],m['short_score']))
+      captured_at=datetime.now().isoformat(timespec='seconds')
+      regime=market_regime_snapshot(fresh_market,previous_market,syms,m['signal'],captured_at)
+      paper_open(sym,m['signal'],m,max(m['long_score'],m['short_score']),regime)
 
    manage()
    manage_strategy_lab()

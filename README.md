@@ -198,6 +198,7 @@ Top-30 havuzu yalnızca MEXC Spot tarafında gerçek USDT kripto çifti bulunan 
 
 ## Score breakdown snapshot
 - Yeni PAPER işlemlerinde açılan yönün trend, RSI, hacim, destek/direnç ve Fibonacci puanları giriş anında `position_score_snapshots` tablosuna sabitlenir.
+- Her yeni PAPER işleminde Top-30 market breadth, 15m yön değişim oranı, BTC/ETH 15m-1h-4h trendleri ve kısa vadeli EMA/momentum durumu `market_regime_snapshots` tablosuna immutable araştırma verisi olarak kaydedilir. `BULLISH`, `BEARISH`, `MIXED` ve `REVERSAL_RISK` sınıfları trading kararlarını veya score'u etkilemez; eski pozisyonlara geriye dönük snapshot üretilmez.
 - RSI, hacim oranı, destek/direnç mesafeleri, en yakın Fibonacci seviyesi/mesafesi ve 15m/1h/4h trend yönleri ham snapshot olarak saklanır.
 - Mevcut score algoritması ve ağırlıkları değiştirilmez; eski işlemler snapshot kaydı olmadan korunur.
 - Strategy Lab deneyi `source_position_id` üzerinden aynı değişmez snapshot'a bağlanabilir.
