@@ -762,6 +762,13 @@ async def _order_fills(client,order_id,contract_size):
 def _active_contract_positions(rows):
  return [x for x in (rows or []) if float(x.get('holdVol') or 0)>0]
 
+def _live_fee_external_oid(test_id,leg):
+ if leg not in ('e','x'):raise ValueError('LIVE_FEE_TEST externalOid leg yalnız e veya x olabilir')
+ prefix=f'lft{int(test_id)}{leg}'
+ random_length=32-len(prefix)
+ if random_length<12:raise ValueError('LIVE_FEE_TEST id güvenli benzersiz externalOid için fazla uzun')
+ return prefix+uuid.uuid4().hex[:random_length]
+
 async def _live_fee_position_after_entry(client,symbol,side):
  expected_type=1 if side=='LONG' else 2
  for _ in range(20):
@@ -1745,7 +1752,7 @@ async def execute_live_fee_test(body:LiveFeeExecute,request:Request):
      await mexc_private_request(client,'GET','/api/v1/private/position/open_positions') or [])
     if any(str(x.get('symbol'))==symbol for x in open_positions):
      raise RuntimeError(f'{symbol} üzerinde açık gerçek LONG/SHORT Futures pozisyonu var')
-    external='live-fee-'+uuid.uuid4().hex
+    external=_live_fee_external_oid(candidate['id'],'e')
     entry_payload={'symbol':symbol,'price':0,'vol':contracts,'leverage':leverage,
      'side':1 if side=='LONG' else 3,'type':5,'openType':1,'positionMode':position_mode,'externalOid':external}
     entry_submitted=True
@@ -1764,7 +1771,7 @@ async def execute_live_fee_test(body:LiveFeeExecute,request:Request):
     exit_reference=float(((state.get('market') or {}).get(symbol) or {}).get('price') or entry_fill['average_fill_price'])
     exit_payload={'symbol':symbol,'price':0,'vol':close_contracts,'leverage':leverage,
      'side':4 if side=='LONG' else 2,'type':5,'openType':1,'positionMode':position_mode,
-     'positionId':position_id,'externalOid':'live-fee-'+uuid.uuid4().hex}
+     'positionId':position_id,'externalOid':_live_fee_external_oid(candidate['id'],'x')}
     if position_mode==2:exit_payload['reduceOnly']=True
     exit_order_id=str(await mexc_private_request(client,'POST','/api/v1/private/order/submit',body=exit_payload))
     await _order_details(client,exit_order_id)

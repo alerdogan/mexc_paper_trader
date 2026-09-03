@@ -212,6 +212,20 @@ def test_execute_requires_exact_explicit_confirmation(isolated_app, monkeypatch)
     assert called is False
 
 
+def test_live_fee_external_oid_is_unique_bounded_and_identifies_test_and_leg(isolated_app):
+    module, _ = isolated_app
+
+    entry_ids = {module._live_fee_external_oid(123, "e") for _ in range(100)}
+    exit_id = module._live_fee_external_oid(123, "x")
+
+    assert len(entry_ids) == 100
+    assert all(len(value) <= 32 for value in entry_ids)
+    assert all(value.startswith("lft123e") for value in entry_ids)
+    assert len(exit_id) <= 32
+    assert exit_id.startswith("lft123x")
+    assert exit_id not in entry_ids
+
+
 def test_order_details_accepts_cancelled_partial_fill(isolated_app, monkeypatch):
     module, _ = isolated_app
 
@@ -392,8 +406,12 @@ def test_execute_hedge_mode_closes_only_fetched_position_and_partial_fill(
     posts = [body for method, _, body in calls if method == "POST"]
     assert posts[0]["positionMode"] == 1
     assert posts[0]["side"] == 1
+    assert len(posts[0]["externalOid"]) <= 32
+    assert posts[0]["externalOid"].startswith(f"lft{test_id}e")
     assert posts[1]["positionMode"] == 1
     assert posts[1]["side"] == 4
+    assert len(posts[1]["externalOid"]) <= 32
+    assert posts[1]["externalOid"].startswith(f"lft{test_id}x")
     assert posts[1]["positionId"] == "hedge-long-1"
     assert posts[1]["vol"] == 0.4
     assert "reduceOnly" not in posts[1]
