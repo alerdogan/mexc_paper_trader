@@ -88,6 +88,30 @@ def test_arm_is_local_and_does_not_enable_orders(isolated_app):
     assert module._live_fee_row(("ARMED",))["id"] == result["id"]
 
 
+def test_live_fee_audit_is_local_and_read_only(isolated_app, monkeypatch):
+    module, _ = isolated_app
+    prepared_candidate(module)
+    calls = []
+
+    async def private(client, method, path, params=None, body=None):
+        calls.append((method, path, body))
+        if path.endswith("open_positions"):
+            return [{"positionId": "other", "symbol": "USELESS_USDT", "positionType": 2, "holdVol": 1}]
+        if "open_orders/BTC_USDT" in path:
+            return []
+        raise AssertionError(path)
+
+    monkeypatch.setattr(module.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(module, "mexc_private_request", private)
+
+    result = asyncio.run(module.live_fee_test_audit(LocalRequest()))
+
+    assert result["symbol"] == "BTC_USDT"
+    assert result["open_position_count"] == 0
+    assert result["open_order_count"] == 0
+    assert all(method == "GET" and body is None for method, _, body in calls)
+
+
 def test_cancel_only_disarms_non_executing_test(isolated_app):
     module, _ = isolated_app
     module.arm_live_fee_test(LocalRequest())

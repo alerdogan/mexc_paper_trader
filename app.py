@@ -1697,6 +1697,24 @@ def live_fee_test_status():
  data['position_check']=state.get('live_fee_position_check')
  return data
 
+@app.get('/api/live-fee-test/audit')
+async def live_fee_test_audit(request:Request):
+ _require_local(request)
+ latest=_live_fee_row(('ARMED','PREPARED','STALE','EXPIRED','PREFLIGHT_FAILED','OPEN_ALARM','COMPLETED','CANCELLED'))
+ symbol=(latest or {}).get('symbol')
+ if not symbol:raise HTTPException(409,'Audit için sembollü LIVE_FEE_TEST kaydı yok.')
+ try:
+  async with httpx.AsyncClient(headers={'User-Agent':'MEXC-Live-Fee-Read-Only-Audit/1.0'}) as client:
+   positions=_active_contract_positions(
+    await mexc_private_request(client,'GET','/api/v1/private/position/open_positions') or [])
+   symbol_positions=[x for x in positions if str(x.get('symbol'))==symbol]
+   orders=await mexc_private_request(client,'GET',f'/api/v1/private/order/list/open_orders/{symbol}') or []
+  return {'symbol':symbol,'open_position_count':len(symbol_positions),'open_order_count':len(orders),
+   'positions':[{'position_id':str(x.get('positionId')),'position_type':x.get('positionType'),
+    'hold_vol':x.get('holdVol')} for x in symbol_positions]}
+ except Exception as e:
+  raise HTTPException(502,redact_credentials(e,credential_get('api_key'),credential_get('api_secret')))
+
 @app.post('/api/live-fee-test/arm')
 def arm_live_fee_test(request:Request):
  _require_local(request)
