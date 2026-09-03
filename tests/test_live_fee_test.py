@@ -116,7 +116,11 @@ def test_prepare_uses_first_liquid_eligible_symbol_without_score_gate(isolated_a
         assert "params" not in kwargs
         return FakePublicResponse()
 
+    async def private(*args, **kwargs):
+        return []
+
     monkeypatch.setattr(module, "mexc_get", public)
+    monkeypatch.setattr(module, "mexc_private_request", private)
     markets = {
         "AAA_USDT": {"15m": {"price": 5, "trend": 1}, "long_score": 99},
         "ZZZ_USDT": {"15m": {"price": 10, "trend": -1}, "short_score": 42},
@@ -130,6 +134,60 @@ def test_prepare_uses_first_liquid_eligible_symbol_without_score_gate(isolated_a
     assert candidate["score"] == 42
     assert candidate["contracts"] == 1
     assert candidate["reference_price"] == 10
+
+
+def test_prepare_skips_btc_with_real_position_and_reports_long_short_check(
+    isolated_app, monkeypatch
+):
+    module, _ = isolated_app
+    module.arm_live_fee_test(LocalRequest())
+
+    class ContractsResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "success": True,
+                "data": [
+                    {
+                        "symbol": symbol,
+                        "apiAllowed": True,
+                        "state": 0,
+                        "settleCoin": "USDT",
+                        "contractSize": 0.001,
+                        "minVol": 1,
+                        "volUnit": 1,
+                        "minLeverage": 1,
+                        "takerFeeRate": 0.0004,
+                    }
+                    for symbol in ("BTC_USDT", "ZZZ_USDT")
+                ],
+            }
+
+    async def public(*args, **kwargs):
+        return ContractsResponse()
+
+    async def private(*args, **kwargs):
+        return [
+            {"positionId": "btc-long", "symbol": "BTC_USDT", "positionType": 1, "holdVol": 2},
+            {"positionId": "eth-short", "symbol": "ETH_USDT", "positionType": 2, "holdVol": 3},
+        ]
+
+    monkeypatch.setattr(module, "mexc_get", public)
+    monkeypatch.setattr(module, "mexc_private_request", private)
+    markets = {
+        "BTC_USDT": {"15m": {"price": 100, "trend": 1}},
+        "ZZZ_USDT": {"15m": {"price": 10, "trend": -1}},
+    }
+
+    asyncio.run(module.maybe_prepare_live_fee_test(None, markets, {}, ["ZZZ_USDT"]))
+
+    candidate = module._live_fee_row(("PREPARED",))
+    assert candidate["symbol"] == "ZZZ_USDT"
+    status = module.live_fee_test_status()
+    assert status["position_check"]["long_symbols"] == ["BTC_USDT"]
+    assert status["position_check"]["short_symbols"] == ["ETH_USDT"]
+    assert status["position_check"]["open_position_count"] == 2
 
 
 def test_execute_requires_exact_explicit_confirmation(isolated_app, monkeypatch):

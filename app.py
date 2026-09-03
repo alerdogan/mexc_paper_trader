@@ -13,7 +13,7 @@ from pydantic import BaseModel
 BASE=Path(__file__).parent; DB=BASE/'trader.db'; app=FastAPI(title='MEXC Futures Paper Trader'); templates=Jinja2Templates(directory=str(BASE/'templates'))
 SERVICE_STARTED_MONOTONIC=time.monotonic()
 DEFAULTS={"symbols":["BTC_USDT"],"top_volume_count":30,"universe_refresh_minutes":15,"paper_balance":4000.0,"risk_per_trade_usd":20.0,"max_alt_notional_usd":5000.0,"max_btc_notional_usd":10000.0,"max_total_open_risk_usd":100.0,"daily_loss_limit_usd":300.0,"leverage":2,"signal_threshold":80,"scan_seconds":30,"stop_atr_mult":1.5,"tp1_r":1.0,"tp1_pct":30.0,"tp2_r":2.0,"tp2_pct":30.0,"runner_pct":40.0,"move_be_at_r":1.0,"min_free_balance_pct":20.0,"paper_fee_rate":0.0008}
-settings=DEFAULTS.copy(); state={"running":False,"panic":False,"entry_paused":False,"last_scan":None,"market":{},"live_prices":{},"last_price_update":None,"scanning":False,"error":None,"feed":"MEXC FUTURES","public_api":None,"api_saved":False,"private_api":None,"paper_test_threshold":None,"universe":[],"universe_updated":None,"scan_duration_sec":None,"rate_limit_wait":None}
+settings=DEFAULTS.copy(); state={"running":False,"panic":False,"entry_paused":False,"last_scan":None,"market":{},"live_prices":{},"last_price_update":None,"scanning":False,"error":None,"feed":"MEXC FUTURES","public_api":None,"api_saved":False,"private_api":None,"paper_test_threshold":None,"universe":[],"universe_updated":None,"scan_duration_sec":None,"rate_limit_wait":None,"live_fee_position_check":None}
 TASK_NAMES=('scanner','position_engine','ghost_analyzer')
 STRATEGY_LAB_MODELS=('CURRENT','NO_STOP_MINI','SMART_EXIT','TRAILING_RUNNER')
 STRATEGY_LAB_VERSION='1.0'
@@ -660,9 +660,26 @@ def _contract_detail(data,symbol):
 async def maybe_prepare_live_fee_test(client,current_market,previous_market,universe_symbols):
  armed=_live_fee_row(('ARMED',))
  if not armed:return
- candidates=[(symbol,current_market.get(symbol) or {}) for symbol in universe_symbols
+ try:
+  positions=_active_contract_positions(
+   await mexc_private_request(client,'GET','/api/v1/private/position/open_positions') or [])
+ except Exception as e:
+  safe=redact_credentials(e,credential_get('api_key'),credential_get('api_secret'))
+  state['live_fee_position_check']={'checked_at':datetime.now().isoformat(timespec='seconds'),'error':safe}
+  _live_fee_update(armed['id'],error='Gerçek açık Futures pozisyonları doğrulanamadı; aday hazırlanmadı')
+  return
+ long_symbols=sorted({str(x.get('symbol')) for x in positions if int(x.get('positionType') or 0)==1})
+ short_symbols=sorted({str(x.get('symbol')) for x in positions if int(x.get('positionType') or 0)==2})
+ occupied_symbols=set(long_symbols)|set(short_symbols)
+ state['live_fee_position_check']={'checked_at':datetime.now().isoformat(timespec='seconds'),
+  'long_symbols':long_symbols,'short_symbols':short_symbols,'open_position_count':len(positions),'error':None}
+ ordered_symbols=list(dict.fromkeys(['BTC_USDT',*universe_symbols]))
+ candidates=[(symbol,current_market.get(symbol) or {}) for symbol in ordered_symbols
+  if symbol not in occupied_symbols
   if float(((current_market.get(symbol) or {}).get('15m') or {}).get('price') or 0)>0]
- if not candidates:return
+ if not candidates:
+  _live_fee_update(armed['id'],error='Açık pozisyonsuz ve güncel fiyatlı aday sembol bulunamadı')
+  return
  r=await mexc_get(client,'https://api.mexc.com/api/v1/contract/detail',timeout=15)
  payload=r.json() if r.status_code==200 else {}
  details=payload.get('data') if payload.get('success') else []
@@ -1668,6 +1685,7 @@ def live_fee_test_status():
   data[field[:-5] if field.endswith('_json') else field]=json.loads(data[field]) if data.get(field) else None
   data.pop(field,None)
  data['confirmation_required']=f"ONAY LIVE_FEE_TEST {data['id']} {data.get('symbol') or ''} {data.get('side') or ''}" if data['status']=='PREPARED' else None
+ data['position_check']=state.get('live_fee_position_check')
  return data
 
 @app.post('/api/live-fee-test/arm')
