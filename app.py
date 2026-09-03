@@ -725,7 +725,9 @@ async def _order_details(client,order_id):
  for _ in range(20):
   order=await mexc_private_request(client,'GET',f'/api/v1/private/order/get/{order_id}')
   if int(order.get('state') or 0)==3 and float(order.get('dealVol') or 0)>0:return order
-  if int(order.get('state') or 0) in (4,5):raise RuntimeError('Order completed olmadan iptal/geçersiz duruma geçti')
+  if int(order.get('state') or 0) in (4,5):
+   if float(order.get('dealVol') or 0)>0:return order
+   raise RuntimeError('Order fill olmadan iptal/geçersiz duruma geçti')
   await asyncio.sleep(.25)
  raise RuntimeError('Order fill doğrulama zaman aşımı')
 
@@ -739,6 +741,38 @@ async def _order_fills(client,order_id,contract_size):
   'notional':avg*vol*contract_size,'actual_fee':fee,'fee_currency':','.join(currencies),
   'trade_ids':[str(x.get('id')) for x in deals],'timestamps':[x.get('timestamp') for x in deals],
   'is_taker':all(bool(x.get('isTaker',x.get('taker',False))) for x in deals)}
+
+def _active_contract_positions(rows):
+ return [x for x in (rows or []) if float(x.get('holdVol') or 0)>0]
+
+async def _live_fee_position_after_entry(client,symbol,side):
+ expected_type=1 if side=='LONG' else 2
+ for _ in range(20):
+  positions=_active_contract_positions(
+   await mexc_private_request(client,'GET','/api/v1/private/position/open_positions') or [])
+  if not positions:
+   await asyncio.sleep(.25); continue
+  matches=[x for x in positions if str(x.get('symbol'))==symbol and int(x.get('positionType') or 0)==expected_type]
+  if len(positions)!=1 or len(matches)!=1:
+   raise RuntimeError('KRİTİK: Entry sonrası tek ve beklenen yönde HEDGE pozisyonu doğrulanamadı')
+  position=matches[0]
+  if not position.get('positionId'):
+   raise RuntimeError('KRİTİK: Entry sonrası gerçek positionId alınamadı')
+  return position
+ raise RuntimeError('KRİTİK: Entry sonrası gerçek HEDGE pozisyonu sorgulanamadı')
+
+async def _assert_live_fee_position_closed(client,position_id):
+ remaining=None
+ for _ in range(20):
+  positions=_active_contract_positions(
+   await mexc_private_request(client,'GET','/api/v1/private/position/open_positions') or [])
+  unexpected=[x for x in positions if str(x.get('positionId'))!=str(position_id)]
+  if unexpected:
+   raise RuntimeError('KRİTİK: Exit sonrası beklenmeyen karşıt/açık HEDGE pozisyonu tespit edildi')
+  remaining=next((x for x in positions if str(x.get('positionId'))==str(position_id)),None)
+  if not remaining:return
+  await asyncio.sleep(.25)
+ raise RuntimeError(f"KRİTİK: Exit sonrası positionId {position_id} üzerinde {remaining.get('holdVol')} contract kaldı")
 
 def has_open(sym):
  c=db(); r=c.execute("SELECT 1 FROM positions WHERE status='OPEN' AND symbol=?",(sym,)).fetchone(); c.close(); return bool(r)
@@ -1684,33 +1718,38 @@ async def execute_live_fee_test(body:LiveFeeExecute,request:Request):
   entry_submitted=False; entry_order_id=None
   try:
    async with httpx.AsyncClient(headers={'User-Agent':'MEXC-Futures-Live-Fee-Test/1.0'}) as client:
-    position_mode=await mexc_private_request(client,'GET','/api/v1/private/position/position_mode')
-    if int(position_mode or 0)!=2:raise RuntimeError('Reduce-only güvenliği için MEXC position mode ONE-WAY olmalı')
+    position_mode=int(await mexc_private_request(client,'GET','/api/v1/private/position/position_mode') or 0)
+    if position_mode not in (1,2):raise RuntimeError(f'Desteklenmeyen MEXC position mode: {position_mode}')
     open_positions=await mexc_private_request(client,'GET','/api/v1/private/position/open_positions') or []
     if any(float(x.get('holdVol') or 0)>0 for x in open_positions):raise RuntimeError('MEXC hesabında açık Futures pozisyonu var')
     symbol=candidate['symbol']; side=candidate['side']; contracts=float(candidate['contracts']); leverage=int(candidate['leverage'])
     external='live-fee-'+uuid.uuid4().hex
     entry_payload={'symbol':symbol,'price':0,'vol':contracts,'leverage':leverage,
-     'side':1 if side=='LONG' else 3,'type':5,'openType':1,'positionMode':2,'externalOid':external}
+     'side':1 if side=='LONG' else 3,'type':5,'openType':1,'positionMode':position_mode,'externalOid':external}
     entry_submitted=True
     entry_order_id=str(await mexc_private_request(client,'POST','/api/v1/private/order/submit',body=entry_payload))
-    entry_order=await _order_details(client,entry_order_id)
+    await _order_details(client,entry_order_id)
     entry_fill=await _order_fills(client,entry_order_id,float(candidate['contract_size']))
+    position=await _live_fee_position_after_entry(client,symbol,side)
+    position_id=str(position['positionId']); position_contracts=float(position.get('holdVol') or 0)
+    executed_contracts=float(entry_fill['executed_contracts'])
+    if position_contracts<=0 or position_contracts-executed_contracts>1e-12:
+     raise RuntimeError('KRİTİK: Gerçek pozisyon miktarı doğrulanmış entry fill miktarını aşıyor')
+    close_contracts=min(position_contracts,executed_contracts)
+    entry_fill['position_contracts']=position_contracts
+    entry_fill['close_contracts']=close_contracts
     _live_fee_update(candidate['id'],entry_order_id=entry_order_id,entry_fill_json=json.dumps(entry_fill,separators=(',',':')))
-    position_id=entry_order.get('positionId')
     exit_reference=float(((state.get('market') or {}).get(symbol) or {}).get('price') or entry_fill['average_fill_price'])
-    exit_payload={'symbol':symbol,'price':0,'vol':entry_fill['executed_contracts'],'leverage':leverage,
-     'side':4 if side=='LONG' else 2,'type':5,'openType':1,'positionMode':2,'reduceOnly':True,
+    exit_payload={'symbol':symbol,'price':0,'vol':close_contracts,'leverage':leverage,
+     'side':4 if side=='LONG' else 2,'type':5,'openType':1,'positionMode':position_mode,
      'positionId':position_id,'externalOid':'live-fee-'+uuid.uuid4().hex}
-    exit_order_id=None; close_error=None
-    for _ in range(3):
-     try:
-      exit_order_id=str(await mexc_private_request(client,'POST','/api/v1/private/order/submit',body=exit_payload)); close_error=None; break
-     except Exception as e:
-      close_error=e; await asyncio.sleep(.25)
-    if exit_order_id is None:raise RuntimeError(f'KRİTİK: LIVE pozisyon kapanmadı: {close_error}')
-    exit_order=await _order_details(client,exit_order_id)
+    if position_mode==2:exit_payload['reduceOnly']=True
+    exit_order_id=str(await mexc_private_request(client,'POST','/api/v1/private/order/submit',body=exit_payload))
+    await _order_details(client,exit_order_id)
     exit_fill=await _order_fills(client,exit_order_id,float(candidate['contract_size']))
+    if float(exit_fill['executed_contracts'])-close_contracts>1e-12:
+     raise RuntimeError('KRİTİK: Exit fill miktarı doğrulanmış entry miktarını aştı')
+    await _assert_live_fee_position_closed(client,position_id)
     funding_data=await mexc_private_request(client,'GET','/api/v1/private/position/funding_records',params={
      'symbol':symbol,'position_id':position_id,'page_num':1,'page_size':100})
     funding_rows=(funding_data or {}).get('resultList') or []; funding=sum(float(x.get('funding') or 0) for x in funding_rows)

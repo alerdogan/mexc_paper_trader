@@ -154,19 +154,35 @@ def test_execute_requires_exact_explicit_confirmation(isolated_app, monkeypatch)
     assert called is False
 
 
+def test_order_details_accepts_cancelled_partial_fill(isolated_app, monkeypatch):
+    module, _ = isolated_app
+
+    async def private(*args, **kwargs):
+        return {"state": 4, "dealVol": 0.4}
+
+    monkeypatch.setattr(module, "mexc_private_request", private)
+
+    result = asyncio.run(module._order_details(None, "partial-order"))
+
+    assert result["dealVol"] == 0.4
+
+
 def test_execute_uses_isolated_minimum_and_reduce_only_then_disarms(
     isolated_app, monkeypatch
 ):
     module, _ = isolated_app
     test_id = prepared_candidate(module)
     calls = []
+    position_checks = iter(
+        [[], [{"positionId": "position-1", "symbol": "BTC_USDT", "positionType": 1, "holdVol": 1}], []]
+    )
 
     async def private(client, method, path, params=None, body=None):
         calls.append((method, path, body))
         if path.endswith("position_mode"):
             return 2
         if path.endswith("open_positions"):
-            return []
+            return next(position_checks)
         if path.endswith("funding_records"):
             return {"resultList": []}
         if method == "POST":
@@ -216,6 +232,202 @@ def test_execute_uses_isolated_minimum_and_reduce_only_then_disarms(
     connection = module.db()
     assert connection.execute("SELECT COUNT(*) FROM positions").fetchone()[0] == 0
     connection.close()
+
+
+def test_execute_hedge_mode_closes_only_fetched_position_and_partial_fill(
+    isolated_app, monkeypatch
+):
+    module, _ = isolated_app
+    test_id = prepared_candidate(module)
+    calls = []
+    position_checks = iter(
+        [
+            [],
+            [{"positionId": "hedge-long-1", "symbol": "BTC_USDT", "positionType": 1, "holdVol": 0.4}],
+            [],
+        ]
+    )
+
+    async def private(client, method, path, params=None, body=None):
+        calls.append((method, path, body))
+        if path.endswith("position_mode"):
+            return 1
+        if path.endswith("open_positions"):
+            return next(position_checks)
+        if path.endswith("funding_records"):
+            assert params["position_id"] == "hedge-long-1"
+            return {"resultList": []}
+        if method == "POST":
+            return "entry-order" if sum(x[0] == "POST" for x in calls) == 1 else "exit-order"
+        raise AssertionError(path)
+
+    async def order_details(client, order_id):
+        return {"state": 3, "dealVol": 0.4}
+
+    async def order_fills(client, order_id, contract_size):
+        contracts = 0.4
+        price = 100.1 if order_id == "entry-order" else 100.0
+        return {
+            "executed_contracts": contracts,
+            "executed_qty": contracts * contract_size,
+            "average_fill_price": price,
+            "notional": price * contracts * contract_size,
+            "actual_fee": price * contracts * contract_size * 0.0008,
+            "fee_currency": "USDT",
+            "trade_ids": [order_id + "-trade"],
+            "timestamps": [1],
+            "is_taker": True,
+        }
+
+    monkeypatch.setattr(module.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(module, "mexc_private_request", private)
+    monkeypatch.setattr(module, "_order_details", order_details)
+    monkeypatch.setattr(module, "_order_fills", order_fills)
+
+    result = asyncio.run(
+        module.execute_live_fee_test(
+            module.LiveFeeExecute(
+                confirmation=f"ONAY LIVE_FEE_TEST {test_id} BTC_USDT LONG"
+            ),
+            LocalRequest(),
+        )
+    )
+
+    posts = [body for method, _, body in calls if method == "POST"]
+    assert posts[0]["positionMode"] == 1
+    assert posts[0]["side"] == 1
+    assert posts[1]["positionMode"] == 1
+    assert posts[1]["side"] == 4
+    assert posts[1]["positionId"] == "hedge-long-1"
+    assert posts[1]["vol"] == 0.4
+    assert "reduceOnly" not in posts[1]
+    assert result["status"] == "COMPLETED"
+
+
+def test_hedge_mode_opposite_leg_after_entry_raises_open_alarm(
+    isolated_app, monkeypatch
+):
+    module, _ = isolated_app
+    test_id = prepared_candidate(module)
+    posts = []
+    position_checks = iter(
+        [
+            [],
+            [{"positionId": "wrong-short", "symbol": "BTC_USDT", "positionType": 2, "holdVol": 1}],
+        ]
+    )
+
+    async def private(client, method, path, params=None, body=None):
+        if path.endswith("position_mode"):
+            return 1
+        if path.endswith("open_positions"):
+            return next(position_checks)
+        if method == "POST":
+            posts.append(body)
+            return "entry-order"
+        raise AssertionError(path)
+
+    async def order_details(client, order_id):
+        return {"state": 3, "dealVol": 1}
+
+    async def order_fills(client, order_id, contract_size):
+        return {
+            "executed_contracts": 1,
+            "executed_qty": contract_size,
+            "average_fill_price": 100,
+            "notional": 100 * contract_size,
+            "actual_fee": 0.00008,
+            "fee_currency": "USDT",
+            "trade_ids": ["entry-trade"],
+            "timestamps": [1],
+            "is_taker": True,
+        }
+
+    monkeypatch.setattr(module.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(module, "mexc_private_request", private)
+    monkeypatch.setattr(module, "_order_details", order_details)
+    monkeypatch.setattr(module, "_order_fills", order_fills)
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            module.execute_live_fee_test(
+                module.LiveFeeExecute(
+                    confirmation=f"ONAY LIVE_FEE_TEST {test_id} BTC_USDT LONG"
+                ),
+                LocalRequest(),
+            )
+        )
+
+    assert "AÇIK LIVE POZİSYON ALARMI" in exc.value.detail
+    assert len(posts) == 1
+    assert posts[0]["side"] == 1
+    assert module._live_fee_row(("OPEN_ALARM",))["id"] == test_id
+
+
+def test_hedge_mode_remaining_position_after_exit_is_open_alarm(
+    isolated_app, monkeypatch
+):
+    module, _ = isolated_app
+    test_id = prepared_candidate(module)
+    position_checks = iter(
+        [
+            [],
+            [{"positionId": "hedge-long-1", "symbol": "BTC_USDT", "positionType": 1, "holdVol": 1}],
+            *[
+                [{"positionId": "hedge-long-1", "symbol": "BTC_USDT", "positionType": 1, "holdVol": 0.2}]
+                for _ in range(20)
+            ],
+        ]
+    )
+    post_count = 0
+
+    async def private(client, method, path, params=None, body=None):
+        nonlocal post_count
+        if path.endswith("position_mode"):
+            return 1
+        if path.endswith("open_positions"):
+            return next(position_checks)
+        if path.endswith("funding_records"):
+            return {"resultList": []}
+        if method == "POST":
+            post_count += 1
+            return "entry-order" if post_count == 1 else "exit-order"
+        raise AssertionError(path)
+
+    async def order_details(client, order_id):
+        return {"state": 3, "dealVol": 1}
+
+    async def order_fills(client, order_id, contract_size):
+        return {
+            "executed_contracts": 1,
+            "executed_qty": contract_size,
+            "average_fill_price": 100,
+            "notional": 100 * contract_size,
+            "actual_fee": 0.00008,
+            "fee_currency": "USDT",
+            "trade_ids": [order_id + "-trade"],
+            "timestamps": [1],
+            "is_taker": True,
+        }
+
+    monkeypatch.setattr(module.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(module, "mexc_private_request", private)
+    monkeypatch.setattr(module, "_order_details", order_details)
+    monkeypatch.setattr(module, "_order_fills", order_fills)
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            module.execute_live_fee_test(
+                module.LiveFeeExecute(
+                    confirmation=f"ONAY LIVE_FEE_TEST {test_id} BTC_USDT LONG"
+                ),
+                LocalRequest(),
+            )
+        )
+
+    assert "AÇIK LIVE POZİSYON ALARMI" in exc.value.detail
+    assert "0.2 contract kaldı" in exc.value.detail
+    assert module._live_fee_row(("OPEN_ALARM",))["id"] == test_id
 
 
 def test_entry_submission_uncertainty_sets_open_position_alarm(isolated_app, monkeypatch):
