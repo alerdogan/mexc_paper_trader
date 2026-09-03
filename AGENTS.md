@@ -40,3 +40,33 @@ Score'un yüksek olmasının otomatik olarak daha kaliteli sinyal anlamına geld
 Karmaşık çözüm yerine mümkün olduğunca basit, ölçülebilir ve test edilebilir çözümü tercih et.
 Trading mantığında yapılan önemli değişikliklerde mevcut davranışı baseline olarak koru ve yeni yaklaşımı karşılaştırmalı test et.
 PAPER ve Strategy Lab verisinin araştırma bütünlüğünü koru.
+
+## Approval Policy
+
+Bu proje icin rutin, geri alinabilir ve proje ici islemlerde kullanicidan onay isteme; isi uctan uca tamamla ve yalnizca sonunda kisa rapor ver.
+
+Asagidaki islemler kullanici onayi olmadan yapilabilir:
+
+- Dosya okuma, arama ve duzenleme.
+- Test calistirma.
+- `git status`, `git diff`, `git add` ve `git commit` islemleri.
+- Localhost `curl` ve health kontrolleri.
+- Normal Python, FastAPI ve UI gelistirmeleri.
+- Log inceleme.
+- Read-only veritabani sorgulari.
+- Mevcut proje icinde guvenli build ve deploy hazirliklari.
+
+Yalnizca asagidaki islemlerden once kullanicidan acik onay iste:
+
+- `sudo` kullanimi.
+- `systemctl` ile servis restart, stop veya start islemleri ya da systemd degisikligi.
+- Isletim sistemi veya paket kurulumu ya da kaldirilmasi.
+- `trader.db` silme, sifirlama veya manuel veri guncelleme.
+- Destructive veya irreversible veritabani migration'i.
+- Credential, API key veya secret goruntuleme ya da degistirme.
+- Gercek LIVE emir gonderme veya LIVE trading davranisini degistirme.
+- `git reset`, `git revert` veya `git checkout` ile mevcut isi geri alma.
+- Dosya silme.
+- Geri dondurulemez veya veri kaybi riski tasiyan herhangi bir islem.
+
+Bu politika mevcut guvenlik kurallarini kaldirmaz veya gevsetmez. Bir celiski halinde daha sikı olan guvenlik kurali uygulanir.
