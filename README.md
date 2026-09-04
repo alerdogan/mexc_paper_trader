@@ -203,6 +203,11 @@ Top-30 havuzu yalnızca MEXC Spot tarafında gerçek USDT kripto çifti bulunan 
 - Mevcut score algoritması ve ağırlıkları değiştirilmez; eski işlemler snapshot kaydı olmadan korunur.
 - Strategy Lab deneyi `source_position_id` üzerinden aynı değişmez snapshot'a bağlanabilir.
 
+## LONG entry quality filter
+- `ENTRY_QUALITY_FILTER_V1` yalnız yeni CURRENT LONG PAPER sinyallerinde çalışır; mevcut 1h/4h trend ve pozisyon yönetimi kurallarını değiştirmez.
+- Coin RSI `>=64`, BTC veya ETH 15m volume ratio `<0.55` ya da coin LONG volume score `0` ise giriş açılmaz. 15m bearish tek başına ret nedeni değildir; SHORT girişleri filtreden geçmez.
+- Reddedilen sinyal, nedenleri ve score/market-regime snapshot kopyalarıyla `entry_filter_rejections` tablosunda `ENTRY_FILTER_REJECTED` olarak saklanır; `/api/entry-filter-rejections` neden bazlı sayım sağlar.
+
 ## Kontrollü LIVE fee doğrulaması
 - Ana uygulama ve scanner daima PAPER kalır. Normal tarama kodu hiçbir LIVE emir göndermez.
 - `LIVE_FEE_TEST`, yalnız localhost'tan açıkça arm edilen, likidite sıralı tarama evrenindeki ilk API-uyumlu sembolü seçen ve ikinci bir birebir onay metni olmadan emir gönderemeyen tek kullanımlık fee doğrulama akışıdır; score veya strateji sinyali adaylık şartı değildir.

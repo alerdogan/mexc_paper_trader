@@ -19,6 +19,7 @@ STRATEGY_LAB_MODELS=('CURRENT','NO_STOP_MINI','SMART_EXIT','TRAILING_RUNNER')
 STRATEGY_LAB_VERSION='1.0'
 SCORE_SNAPSHOT_VERSION='1.0'
 MARKET_REGIME_SNAPSHOT_VERSION='1.0'
+ENTRY_QUALITY_FILTER_VERSION='ENTRY_QUALITY_FILTER_V1'
 SUPERVISOR_BACKOFF=(1,2,5,10,30)
 background_tasks={}
 live_fee_test_lock=asyncio.Lock()
@@ -128,6 +129,16 @@ def init_db():
   exit_order_id TEXT,exit_fill_json TEXT,funding REAL DEFAULT 0,result_json TEXT,
   error TEXT,completed_at TEXT
  )''')
+ c.execute('''CREATE TABLE IF NOT EXISTS entry_filter_rejections(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,filter_version TEXT NOT NULL,status TEXT NOT NULL,
+  symbol TEXT NOT NULL,side TEXT NOT NULL,score REAL NOT NULL,rejected_at TEXT NOT NULL,
+  reasons_json TEXT NOT NULL,reference_price REAL,coin_rsi REAL,btc_15m_volume_ratio REAL,
+  eth_15m_volume_ratio REAL,coin_volume_score REAL,coin_trend_15m INTEGER,
+  coin_trend_1h INTEGER,coin_trend_4h INTEGER,score_snapshot_json TEXT NOT NULL,
+  market_regime_snapshot_json TEXT NOT NULL
+ )''')
+ c.execute('CREATE INDEX IF NOT EXISTS idx_entry_filter_rejections_version_time ON entry_filter_rejections(filter_version,rejected_at)')
+ c.execute('CREATE INDEX IF NOT EXISTS idx_entry_filter_rejections_symbol ON entry_filter_rejections(symbol,rejected_at)')
  # Existing open positions can only be tracked accurately from this upgrade forward.
  now_iso=datetime.now().isoformat(timespec='seconds')
  c.execute("UPDATE positions SET tracking_started_at=? WHERE status='OPEN' AND tracking_started_at IS NULL",(now_iso,))
@@ -641,6 +652,53 @@ def _insert_market_regime_snapshot(c,position_id,snapshot):
   f"INSERT INTO market_regime_snapshots ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
   (position_id,*snapshot.values())
  )
+
+def _long_entry_quality_reasons(m,current_market):
+ m15=m.get('15m') or {}
+ snapshot=score_snapshot(m,'LONG',float(m.get('long_score') or 0),datetime.now().isoformat(timespec='seconds'))
+ coin_rsi=float(m15.get('rsi')) if m15.get('rsi') is not None else None
+ btc_ratio=((current_market.get('BTC_USDT') or {}).get('15m') or {}).get('volume_ratio')
+ eth_ratio=((current_market.get('ETH_USDT') or {}).get('15m') or {}).get('volume_ratio')
+ volume_score=snapshot.get('volume_score')
+ reasons=[]
+ if coin_rsi is not None and coin_rsi>=64:reasons.append('COIN_RSI_GTE_64')
+ if btc_ratio is not None and float(btc_ratio)<0.55:reasons.append('BTC_15M_VOLUME_RATIO_LT_0_55')
+ if eth_ratio is not None and float(eth_ratio)<0.55:reasons.append('ETH_15M_VOLUME_RATIO_LT_0_55')
+ if volume_score is not None and float(volume_score)==0:reasons.append('COIN_VOLUME_SCORE_EQ_0')
+ return reasons,snapshot
+
+def _record_entry_filter_rejection(symbol,m,score,current_market,previous_market,universe_symbols,captured_at,reasons,score_data):
+ regime=market_regime_snapshot(current_market,previous_market,universe_symbols,'LONG',captured_at)
+ m15=m.get('15m') or {}
+ btc_ratio=((current_market.get('BTC_USDT') or {}).get('15m') or {}).get('volume_ratio')
+ eth_ratio=((current_market.get('ETH_USDT') or {}).get('15m') or {}).get('volume_ratio')
+ def write(c):
+  c.execute('''INSERT INTO entry_filter_rejections(
+   filter_version,status,symbol,side,score,rejected_at,reasons_json,reference_price,
+   coin_rsi,btc_15m_volume_ratio,eth_15m_volume_ratio,coin_volume_score,
+   coin_trend_15m,coin_trend_1h,coin_trend_4h,score_snapshot_json,market_regime_snapshot_json
+   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(
+   ENTRY_QUALITY_FILTER_VERSION,'ENTRY_FILTER_REJECTED',symbol,'LONG',float(score),captured_at,
+   json.dumps(reasons,separators=(',',':')),m15.get('price'),m15.get('rsi'),btc_ratio,eth_ratio,
+   score_data.get('volume_score'),m15.get('trend'),(m.get('1h') or {}).get('trend'),
+   (m.get('4h') or {}).get('trend'),json.dumps(score_data,ensure_ascii=False,separators=(',',':')),
+   json.dumps(regime,ensure_ascii=False,separators=(',',':'))))
+ _sqlite_write_with_retry(write)
+ log(f'{ENTRY_QUALITY_FILTER_VERSION} {symbol} LONG ENTRY_FILTER_REJECTED · {",".join(reasons)}','RESEARCH')
+
+def process_paper_signal(symbol,m,current_market,previous_market,universe_symbols):
+ side=m.get('signal')
+ if side not in ('LONG','SHORT') or has_open(symbol):return None
+ score=max(float(m.get('long_score') or 0),float(m.get('short_score') or 0))
+ captured_at=datetime.now().isoformat(timespec='seconds')
+ regime=market_regime_snapshot(current_market,previous_market,universe_symbols,side,captured_at)
+ if side=='LONG':
+  reasons,score_data=_long_entry_quality_reasons(m,current_market)
+  if reasons:
+   _record_entry_filter_rejection(symbol,m,score,current_market,previous_market,universe_symbols,
+    captured_at,reasons,score_data)
+   return 'ENTRY_FILTER_REJECTED'
+ return paper_open(symbol,side,m,score,regime)
 
 def _live_fee_row(statuses):
  c=db(); marks=','.join('?' for _ in statuses)
@@ -1242,9 +1300,7 @@ async def scan_once(force_universe=False):
     for sym in syms:
      m=fresh_market.get(sym)
      if m and m['signal']!='BEKLE':
-      captured_at=datetime.now().isoformat(timespec='seconds')
-      regime=market_regime_snapshot(fresh_market,previous_market,syms,m['signal'],captured_at)
-      paper_open(sym,m['signal'],m,max(m['long_score'],m['short_score']),regime)
+      process_paper_signal(sym,m,fresh_market,previous_market,syms)
 
    manage()
    manage_strategy_lab()
@@ -1415,6 +1471,18 @@ def status():
  reserve=max(current_balance,0.0)*max(float(settings.get('min_free_balance_pct',20.0)),0.0)/100.0
  available_margin=max(0.0,current_balance-used_margin-reserve)
  return {'state':state,'settings':settings,'positions':pos,'logs':logs,'open_risk':open_risk(),'available_open_risk':max(0.0,float(settings['max_total_open_risk_usd'])-open_risk()),'period_stats':stats,'effective_threshold':int(state['paper_test_threshold'] or settings['signal_threshold']),'portfolio':{'starting_balance':float(settings['paper_balance']),'current_balance':current_balance,'all_time_closed_pnl':total_closed,'all_time_realized_pnl':total_realized,'unrealized_pnl':unrealized,'open_realized_pnl':realized_open,'today_closed_pnl':stats['daily']['pnl'],'equity':equity,'used_margin':used_margin,'reserve_balance':reserve,'available_margin':available_margin}}
+
+@app.get('/api/entry-filter-rejections')
+def entry_filter_rejections():
+ c=db(); rows=[dict(x) for x in c.execute('''SELECT * FROM entry_filter_rejections
+  WHERE filter_version=? ORDER BY id DESC LIMIT 500''',(ENTRY_QUALITY_FILTER_VERSION,)).fetchall()]; c.close()
+ reason_counts={}
+ for row in rows:
+  row['reasons']=json.loads(row.pop('reasons_json'))
+  for reason in row['reasons']:reason_counts[reason]=reason_counts.get(reason,0)+1
+  row.pop('score_snapshot_json',None); row.pop('market_regime_snapshot_json',None)
+ return {'filter_version':ENTRY_QUALITY_FILTER_VERSION,'total':len(rows),'reason_counts':reason_counts,'rows':rows}
+
 @app.get('/api/history')
 def history(period: str='all'):
  if period not in {'today','week','month','all'}: raise HTTPException(400,'Geçersiz geçmiş filtresi')
