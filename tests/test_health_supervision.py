@@ -147,12 +147,8 @@ def test_dashboard_contains_compact_health_panel():
         assert f'id="{element_id}"' in template
 
 
-def test_dashboard_contains_live_fee_test_controls():
+def test_dashboard_does_not_expose_live_fee_test_controls():
     template = (app.BASE / "templates" / "index.html").read_text()
 
-    assert 'id="liveFeeTestPanel"' in template
-    assert "GET /api/live-fee-test/status" not in template
-    assert "fetch('/api/live-fee-test/status')" in template
-    assert "LIVE FEE TESTİNİ ONAYLA" in template
-    assert "ONAY LIVE_FEE_TEST" in template
-    assert "post('/api/live-fee-test/cancel')" in template
+    assert 'id="liveFeeTestPanel"' not in template
+    assert "refreshLiveFeeTest();" not in template
