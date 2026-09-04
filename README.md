@@ -207,6 +207,7 @@ Top-30 havuzu yalnızca MEXC Spot tarafında gerçek USDT kripto çifti bulunan 
 - `ENTRY_QUALITY_FILTER_V1` yalnız yeni CURRENT LONG PAPER sinyallerinde çalışır; mevcut 1h/4h trend ve pozisyon yönetimi kurallarını değiştirmez.
 - Coin RSI `>=64`, BTC veya ETH 15m volume ratio `<0.55` ya da coin LONG volume score `0` ise giriş açılmaz. 15m bearish tek başına ret nedeni değildir; SHORT girişleri filtreden geçmez.
 - Reddedilen sinyal, nedenleri ve score/market-regime snapshot kopyalarıyla `entry_filter_rejections` tablosunda `ENTRY_FILTER_REJECTED` olarak saklanır; `/api/entry-filter-rejections` neden bazlı sayım sağlar.
+- Aynı symbol+side kesintisiz reject setup'ı scanner tekrarlarında tek opportunity olarak sayılır; yeni nedenler aynı kayda eklenir. Sinyal bozulup yeniden oluştuğunda yeni opportunity başlar; eski kayıtlar geriye dönük değiştirilmez.
 
 ## Kontrollü LIVE fee doğrulaması
 - Ana uygulama ve scanner daima PAPER kalır. Normal tarama kodu hiçbir LIVE emir göndermez.

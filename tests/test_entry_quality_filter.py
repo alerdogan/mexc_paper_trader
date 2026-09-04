@@ -117,3 +117,36 @@ def test_rejection_summary_counts_each_reason(isolated_app):
         "ETH_15M_VOLUME_RATIO_LT_0_55": 1,
         "COIN_VOLUME_SCORE_EQ_0": 1,
     }
+
+
+def test_continuous_rejected_setup_is_one_opportunity_and_rearms_after_signal_break(
+    isolated_app,
+):
+    module, _ = isolated_app
+    coin = market(rsi=64)
+    current = universe(coin)
+
+    module.process_paper_signal("ALT_USDT", coin, current, {}, list(current))
+    module.process_paper_signal("ALT_USDT", coin, current, current, list(current))
+    coin["score_details"][0]["long"] = 0
+    module.process_paper_signal("ALT_USDT", coin, current, current, list(current))
+
+    connection = module.db()
+    rows = connection.execute(
+        "SELECT reasons_json FROM entry_filter_rejections ORDER BY id"
+    ).fetchall()
+    connection.close()
+    assert len(rows) == 1
+    assert json.loads(rows[0]["reasons_json"]) == [
+        "COIN_RSI_GTE_64",
+        "COIN_VOLUME_SCORE_EQ_0",
+    ]
+
+    coin["signal"] = "BEKLE"
+    module.process_paper_signal("ALT_USDT", coin, current, current, list(current))
+    coin["signal"] = "LONG"
+    module.process_paper_signal("ALT_USDT", coin, current, current, list(current))
+
+    connection = module.db()
+    assert connection.execute("SELECT COUNT(*) FROM entry_filter_rejections").fetchone()[0] == 2
+    connection.close()

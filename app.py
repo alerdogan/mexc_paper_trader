@@ -139,6 +139,11 @@ def init_db():
  )''')
  c.execute('CREATE INDEX IF NOT EXISTS idx_entry_filter_rejections_version_time ON entry_filter_rejections(filter_version,rejected_at)')
  c.execute('CREATE INDEX IF NOT EXISTS idx_entry_filter_rejections_symbol ON entry_filter_rejections(symbol,rejected_at)')
+ c.execute('''CREATE TABLE IF NOT EXISTS entry_filter_active_setups(
+  symbol TEXT NOT NULL,side TEXT NOT NULL,rejection_id INTEGER NOT NULL,
+  reasons_json TEXT NOT NULL,first_seen_at TEXT NOT NULL,last_seen_at TEXT NOT NULL,
+  PRIMARY KEY(symbol,side)
+ )''')
  # Existing open positions can only be tracked accurately from this upgrade forward.
  now_iso=datetime.now().isoformat(timespec='seconds')
  c.execute("UPDATE positions SET tracking_started_at=? WHERE status='OPEN' AND tracking_started_at IS NULL",(now_iso,))
@@ -673,7 +678,16 @@ def _record_entry_filter_rejection(symbol,m,score,current_market,previous_market
  btc_ratio=((current_market.get('BTC_USDT') or {}).get('15m') or {}).get('volume_ratio')
  eth_ratio=((current_market.get('ETH_USDT') or {}).get('15m') or {}).get('volume_ratio')
  def write(c):
-  c.execute('''INSERT INTO entry_filter_rejections(
+  active=c.execute('SELECT * FROM entry_filter_active_setups WHERE symbol=? AND side=?',(symbol,'LONG')).fetchone()
+  if active:
+   combined=list(dict.fromkeys([*json.loads(active['reasons_json']),*reasons]))
+   if combined!=json.loads(active['reasons_json']):
+    c.execute('UPDATE entry_filter_rejections SET reasons_json=? WHERE id=?',
+     (json.dumps(combined,separators=(',',':')),active['rejection_id']))
+   c.execute('UPDATE entry_filter_active_setups SET reasons_json=?,last_seen_at=? WHERE symbol=? AND side=?',
+    (json.dumps(combined,separators=(',',':')),captured_at,symbol,'LONG'))
+   return 'UPDATED' if combined!=json.loads(active['reasons_json']) else 'DUPLICATE'
+  cur=c.execute('''INSERT INTO entry_filter_rejections(
    filter_version,status,symbol,side,score,rejected_at,reasons_json,reference_price,
    coin_rsi,btc_15m_volume_ratio,eth_15m_volume_ratio,coin_volume_score,
    coin_trend_15m,coin_trend_1h,coin_trend_4h,score_snapshot_json,market_regime_snapshot_json
@@ -683,11 +697,20 @@ def _record_entry_filter_rejection(symbol,m,score,current_market,previous_market
    score_data.get('volume_score'),m15.get('trend'),(m.get('1h') or {}).get('trend'),
    (m.get('4h') or {}).get('trend'),json.dumps(score_data,ensure_ascii=False,separators=(',',':')),
    json.dumps(regime,ensure_ascii=False,separators=(',',':'))))
+  c.execute('''INSERT INTO entry_filter_active_setups(symbol,side,rejection_id,reasons_json,first_seen_at,last_seen_at)
+   VALUES(?,?,?,?,?,?)''',(symbol,'LONG',cur.lastrowid,json.dumps(reasons,separators=(',',':')),captured_at,captured_at))
+  return 'CREATED'
+ action=_sqlite_write_with_retry(write)
+ if action!='DUPLICATE':
+  log(f'{ENTRY_QUALITY_FILTER_VERSION} {symbol} LONG ENTRY_FILTER_REJECTED {action} · {",".join(reasons)}','RESEARCH')
+
+def _clear_entry_filter_setup(symbol):
+ def write(c):c.execute('DELETE FROM entry_filter_active_setups WHERE symbol=? AND side=?',(symbol,'LONG'))
  _sqlite_write_with_retry(write)
- log(f'{ENTRY_QUALITY_FILTER_VERSION} {symbol} LONG ENTRY_FILTER_REJECTED · {",".join(reasons)}','RESEARCH')
 
 def process_paper_signal(symbol,m,current_market,previous_market,universe_symbols):
  side=m.get('signal')
+ if side!='LONG':_clear_entry_filter_setup(symbol)
  if side not in ('LONG','SHORT') or has_open(symbol):return None
  score=max(float(m.get('long_score') or 0),float(m.get('short_score') or 0))
  captured_at=datetime.now().isoformat(timespec='seconds')
@@ -698,6 +721,7 @@ def process_paper_signal(symbol,m,current_market,previous_market,universe_symbol
    _record_entry_filter_rejection(symbol,m,score,current_market,previous_market,universe_symbols,
     captured_at,reasons,score_data)
    return 'ENTRY_FILTER_REJECTED'
+  _clear_entry_filter_setup(symbol)
  return paper_open(symbol,side,m,score,regime)
 
 def _live_fee_row(statuses):
@@ -1299,7 +1323,7 @@ async def scan_once(force_universe=False):
     # Open eligible PAPER trades only after all analysis tasks finish.
     for sym in syms:
      m=fresh_market.get(sym)
-     if m and m['signal']!='BEKLE':
+     if m:
       process_paper_signal(sym,m,fresh_market,previous_market,syms)
 
    manage()
