@@ -103,7 +103,7 @@
   <div class="healthCell"><span class="statusLabel">Uptime</span><span id="healthUptime" class="healthValue">—</span></div>
  </div>
 </section>
-<div class="nav"><button class="ghost active" data-page="positionsPage" onclick="showPage('positionsPage',this)">1 · Pozisyonlar</button><button class="ghost" data-page="scannerPage" onclick="showPage('scannerPage',this)">2 · Piyasa Tarayıcı</button><button class="ghost" data-page="opportunitiesPage" onclick="showPage('opportunitiesPage',this)">3 · Yaklaşan Fırsatlar</button><button class="ghost" data-page="settingsPage" onclick="showPage('settingsPage',this)">4 · Ayarlar</button><button class="ghost" data-page="stopAnalyzerPage" onclick="showPage('stopAnalyzerPage',this);loadStopAnalysis()">5 · Stop Analizi</button><button class="ghost" data-page="strategyLabPage" onclick="showPage('strategyLabPage',this);loadStrategyLab()">6 · Strategy Lab</button></div>
+<div class="nav"><button class="ghost active" data-page="positionsPage" onclick="showPage('positionsPage',this)">1 · Pozisyonlar</button><button class="ghost" data-page="scannerPage" onclick="showPage('scannerPage',this)">2 · Piyasa Tarayıcı</button><button class="ghost" data-page="opportunitiesPage" onclick="showPage('opportunitiesPage',this)">3 · Yaklaşan Fırsatlar</button><button class="ghost" data-page="settingsPage" onclick="showPage('settingsPage',this)">4 · Ayarlar</button><button class="ghost" data-page="stopAnalyzerPage" onclick="showPage('stopAnalyzerPage',this);loadStopAnalysis()">5 · Stop Analizi</button><button class="ghost" data-page="strategyLabPage" onclick="showPage('strategyLabPage',this);loadStrategyLab()">6 · Strategy Lab</button><button class="ghost" data-page="entryFilterPage" onclick="showPage('entryFilterPage',this);loadEntryFilter()">7 · ENTRY FILTER</button></div>
 
 <div id="positionsPage" class="page active">
 <div class="grid"><div class="card"><div class="muted">Sanal Kasa</div><div class="big" id="bal">—</div></div><div class="card"><div class="muted">Tahmini Equity</div><div class="big" id="equity">—</div></div><div class="card"><div class="muted">Açık Pozisyon K/Z</div><div class="big" id="unrealized">—</div></div><div class="card"><div class="muted">Açık Risk</div><div class="big" id="risk">—</div><div class="muted" id="availableRisk">Yeni işlem için kullanılabilir risk: —</div></div></div>
@@ -151,6 +151,21 @@
   <div style="overflow:auto"><table><thead><tr><th>Metrik</th><th>CURRENT</th><th>NO_STOP_MINI</th><th>SMART_EXIT</th><th>TRAILING_RUNNER</th></tr></thead><tbody id="strategyLabComparison"></tbody></table></div>
  </section>
  <section class="card"><h2>Deneyler</h2><div style="overflow:auto"><table><thead><tr><th>#</th><th>Coin</th><th>Yön</th><th>Giriş</th><th>CURRENT</th><th>NO_STOP_MINI</th><th>SMART_EXIT</th><th>TRAILING_RUNNER</th><th>CURRENT Stop</th></tr></thead><tbody id="strategyLabRows"></tbody></table></div></section>
+</div>
+
+<div id="entryFilterPage" class="page">
+ <div class="grid">
+  <div class="card"><div class="muted">Toplam Reddedilen Sinyal</div><div class="big" id="entryFilterTotal">—</div></div>
+  <div class="card"><div class="muted">RSI ≥ 64</div><div class="big" id="entryFilterRsi">—</div></div>
+  <div class="card"><div class="muted">BTC 15m Hacim &lt; 0.55</div><div class="big" id="entryFilterBtcVolume">—</div></div>
+  <div class="card"><div class="muted">ETH 15m Hacim &lt; 0.55</div><div class="big" id="entryFilterEthVolume">—</div></div>
+  <div class="card"><div class="muted">Coin Volume Score = 0</div><div class="big" id="entryFilterCoinVolume">—</div></div>
+ </div>
+ <section class="card">
+  <h2>ENTRY FILTER <span class="badge paper">ENTRY_QUALITY_FILTER_V1</span></h2>
+  <div id="entryFilterMsg" class="muted" style="margin-bottom:12px">Reddedilen LONG sinyalleri yükleniyor…</div>
+  <div style="overflow:auto"><table><thead><tr><th>Tarih / Saat</th><th>Coin</th><th>Yön</th><th>Signal Score</th><th>RSI</th><th>BTC 15m Volume</th><th>ETH 15m Volume</th><th>Coin Volume Score</th><th>Reject Nedeni / Nedenleri</th></tr></thead><tbody id="entryFilterRows"></tbody></table></div>
+ </section>
 </div>
 
 <div id="settingsPage" class="page"><section class="card"><h2>MEXC Bağlantı / API Ayarları</h2><div class="muted" style="margin-bottom:10px">Piyasa taraması public Futures API ile anahtarsız çalışır. Key/Secret yalnız Mac Keychain'de tutulur; PAPER modunda emir gönderilmez.</div><div class="grid" style="grid-template-columns:repeat(3,1fr)"><div><label>API Key<input id="apiKey" type="password" autocomplete="off" placeholder="API Key"></label></div><div><label>Secret Key<input id="apiSecret" type="password" autocomplete="off" placeholder="Secret Key"></label></div><div><div class="muted">Durum</div><div id="apiState" style="font-weight:800;margin-top:8px">—</div></div></div><button class="save" onclick="saveApi()">API Bilgilerini Mac'e Kaydet</button> <button class="scan" onclick="testPublic()">Futures Veri Bağlantısını Test Et</button> <button class="go" onclick="testPrivate()">API Key'i Test Et</button><div id="apiMsg" class="muted" style="margin-top:10px"></div></section>
@@ -250,6 +265,15 @@ async function loadStrategyLab(){
   strategyLabMsg.textContent=d.error?'Lab izleme hatası: '+d.error:`Model sürümü ${d.model_version} · Fee sonrası net sonuçlar`;
  }catch(e){strategyLabMsg.textContent='Strategy Lab verisi alınamadı: '+e.message}
 }
+async function loadEntryFilter(){
+ try{
+  let r=await fetch('/api/entry-filter-rejections'),d=await r.json();if(!r.ok)throw new Error(d.detail||r.status);
+  let counts=d.reason_counts||{},reasonLabels={COIN_RSI_GTE_64:'Coin RSI ≥ 64',BTC_15M_VOLUME_RATIO_LT_0_55:'BTC 15m volume ratio < 0.55',ETH_15M_VOLUME_RATIO_LT_0_55:'ETH 15m volume ratio < 0.55',COIN_VOLUME_SCORE_EQ_0:'Coin volume score = 0'};
+  entryFilterTotal.textContent=fmt(d.total,0);entryFilterRsi.textContent=fmt(counts.COIN_RSI_GTE_64,0);entryFilterBtcVolume.textContent=fmt(counts.BTC_15M_VOLUME_RATIO_LT_0_55,0);entryFilterEthVolume.textContent=fmt(counts.ETH_15M_VOLUME_RATIO_LT_0_55,0);entryFilterCoinVolume.textContent=fmt(counts.COIN_VOLUME_SCORE_EQ_0,0);
+  entryFilterRows.innerHTML=(d.rows||[]).map(x=>`<tr><td>${x.rejected_at||'—'}</td><td><b>${x.symbol||'—'}</b></td><td class="long">${x.side||'—'}</td><td>${fmt(x.score,0)}</td><td>${x.coin_rsi==null?'—':fmt(x.coin_rsi,2)}</td><td>${x.btc_15m_volume_ratio==null?'—':fmt(x.btc_15m_volume_ratio,3)}</td><td>${x.eth_15m_volume_ratio==null?'—':fmt(x.eth_15m_volume_ratio,3)}</td><td>${x.coin_volume_score==null?'—':fmt(x.coin_volume_score,0)}</td><td>${(x.reasons||[]).map(reason=>reasonLabels[reason]||reason).join('<br>')||'—'}</td></tr>`).join('')||'<tr><td colspan="9" class="muted">Henüz reddedilmiş LONG sinyali yok.</td></tr>';
+  entryFilterMsg.textContent=`${d.filter_version||'ENTRY_QUALITY_FILTER_V1'} · Her sinyal toplamda bir kez sayılır; birden fazla reject nedeni aynı satırda birlikte gösterilir.`;
+ }catch(e){entryFilterMsg.textContent='ENTRY FILTER verisi alınamadı: '+e.message}
+}
 async function loadStopAnalysis(){
  try{
   let r=await fetch('/api/stop-analysis'),d=await r.json(),s=d.summary||{};
@@ -305,5 +329,5 @@ async function confirmBulkClose(stopBot){
  finally{bulkCloseInFlight=false;btnCloseAll.disabled=false;btnCloseAllStop.disabled=false}
 }
 async function closePosition(id,symbol,side){if(!confirm(`${symbol} ${side} PAPER pozisyonunu anlık fiyattan kapatmak istiyor musun?`))return;try{let j=await post(`/api/positions/${id}/close`);alert(`${symbol} kapatıldı. Gerçekleşen K/Z: ${money(j.pnl)}`);await loadHistory();await refresh()}catch(e){alert('Pozisyon kapatılamadı: '+e.message)}}
-async function save(){let o={};new FormData(settings).forEach((v,k)=>o[k]=Number(v));await post('/api/settings',o)}refresh();refreshHealth();loadHistory();setInterval(()=>{refresh();refreshHealth();if(document.getElementById('positionsPage').classList.contains('active'))loadHistory();if(document.getElementById('strategyLabPage').classList.contains('active'))loadStrategyLab()},5000);
+async function save(){let o={};new FormData(settings).forEach((v,k)=>o[k]=Number(v));await post('/api/settings',o)}refresh();refreshHealth();loadHistory();setInterval(()=>{refresh();refreshHealth();if(document.getElementById('positionsPage').classList.contains('active'))loadHistory();if(document.getElementById('strategyLabPage').classList.contains('active'))loadStrategyLab();if(document.getElementById('entryFilterPage').classList.contains('active'))loadEntryFilter()},5000);
 </script></body></html>

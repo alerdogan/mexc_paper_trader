@@ -152,3 +152,24 @@ def test_dashboard_does_not_expose_live_fee_test_controls():
 
     assert 'id="liveFeeTestPanel"' not in template
     assert "refreshLiveFeeTest();" not in template
+
+
+def test_dashboard_contains_separate_entry_filter_page():
+    template = (app.BASE / "templates" / "index.html").read_text()
+
+    assert 'data-page="entryFilterPage"' in template
+    assert 'id="entryFilterPage" class="page"' in template
+    assert "fetch('/api/entry-filter-rejections')" in template
+    for element_id in (
+        "entryFilterTotal",
+        "entryFilterRsi",
+        "entryFilterBtcVolume",
+        "entryFilterEthVolume",
+        "entryFilterCoinVolume",
+        "entryFilterRows",
+    ):
+        assert f'id="{element_id}"' in template
+    assert "COIN_RSI_GTE_64" in template
+    assert "BTC_15M_VOLUME_RATIO_LT_0_55" in template
+    assert "ETH_15M_VOLUME_RATIO_LT_0_55" in template
+    assert "COIN_VOLUME_SCORE_EQ_0" in template
