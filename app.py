@@ -20,6 +20,7 @@ STRATEGY_LAB_VERSION='1.0'
 SCORE_SNAPSHOT_VERSION='1.0'
 MARKET_REGIME_SNAPSHOT_VERSION='1.0'
 ENTRY_QUALITY_FILTER_VERSION='ENTRY_QUALITY_FILTER_V1'
+REJECT_SHADOW_VERSION='REJECT_SHADOW_V1'
 SUPERVISOR_BACKOFF=(1,2,5,10,30)
 background_tasks={}
 live_fee_test_lock=asyncio.Lock()
@@ -144,6 +145,23 @@ def init_db():
   reasons_json TEXT NOT NULL,first_seen_at TEXT NOT NULL,last_seen_at TEXT NOT NULL,
   PRIMARY KEY(symbol,side)
  )''')
+ c.execute('''CREATE TABLE IF NOT EXISTS reject_shadow_trades(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,rejection_id INTEGER NOT NULL UNIQUE,
+  shadow_version TEXT NOT NULL,status TEXT NOT NULL,symbol TEXT NOT NULL,side TEXT NOT NULL,
+  entry_at TEXT NOT NULL,close_at TEXT,entry_price REAL NOT NULL,exit_price REAL,
+  initial_stop REAL NOT NULL,current_stop REAL NOT NULL,qty REAL NOT NULL,remaining_qty REAL NOT NULL,
+  initial_risk_usd REAL NOT NULL,signal_score REAL NOT NULL,reasons_json TEXT NOT NULL,
+  coin_rsi REAL,btc_15m_volume_ratio REAL,eth_15m_volume_ratio REAL,coin_volume_score REAL,
+  score_snapshot_json TEXT NOT NULL,market_regime_snapshot_json TEXT NOT NULL,
+  mae REAL NOT NULL DEFAULT 0,mae_r REAL NOT NULL DEFAULT 0,mfe REAL NOT NULL DEFAULT 0,mfe_r REAL NOT NULL DEFAULT 0,
+  tp1_hit INTEGER NOT NULL DEFAULT 0,tp2_hit INTEGER NOT NULL DEFAULT 0,
+  gross_simulated_pnl REAL NOT NULL DEFAULT 0,simulated_fee REAL NOT NULL DEFAULT 0,
+  net_simulated_pnl REAL NOT NULL DEFAULT 0,final_exit_reason TEXT,
+  filter_result TEXT NOT NULL DEFAULT 'OPEN',avoided_loss REAL NOT NULL DEFAULT 0,
+  missed_profit REAL NOT NULL DEFAULT 0,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,
+  FOREIGN KEY(rejection_id) REFERENCES entry_filter_rejections(id)
+ )''')
+ c.execute('CREATE INDEX IF NOT EXISTS idx_reject_shadow_status ON reject_shadow_trades(status)')
  # Existing open positions can only be tracked accurately from this upgrade forward.
  now_iso=datetime.now().isoformat(timespec='seconds')
  c.execute("UPDATE positions SET tracking_started_at=? WHERE status='OPEN' AND tracking_started_at IS NULL",(now_iso,))
@@ -684,6 +702,8 @@ def _record_entry_filter_rejection(symbol,m,score,current_market,previous_market
    if combined!=json.loads(active['reasons_json']):
     c.execute('UPDATE entry_filter_rejections SET reasons_json=? WHERE id=?',
      (json.dumps(combined,separators=(',',':')),active['rejection_id']))
+    c.execute('UPDATE reject_shadow_trades SET reasons_json=?,updated_at=? WHERE rejection_id=?',
+     (json.dumps(combined,separators=(',',':')),captured_at,active['rejection_id']))
    c.execute('UPDATE entry_filter_active_setups SET reasons_json=?,last_seen_at=? WHERE symbol=? AND side=?',
     (json.dumps(combined,separators=(',',':')),captured_at,symbol,'LONG'))
    return 'UPDATED' if combined!=json.loads(active['reasons_json']) else 'DUPLICATE'
@@ -697,6 +717,18 @@ def _record_entry_filter_rejection(symbol,m,score,current_market,previous_market
    score_data.get('volume_score'),m15.get('trend'),(m.get('1h') or {}).get('trend'),
    (m.get('4h') or {}).get('trend'),json.dumps(score_data,ensure_ascii=False,separators=(',',':')),
    json.dumps(regime,ensure_ascii=False,separators=(',',':'))))
+  plan=_current_entry_plan(symbol,'LONG',m)
+  c.execute('''INSERT INTO reject_shadow_trades(
+   rejection_id,shadow_version,status,symbol,side,entry_at,entry_price,initial_stop,current_stop,
+   qty,remaining_qty,initial_risk_usd,signal_score,reasons_json,coin_rsi,btc_15m_volume_ratio,
+   eth_15m_volume_ratio,coin_volume_score,score_snapshot_json,market_regime_snapshot_json,
+   simulated_fee,net_simulated_pnl,created_at,updated_at
+   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(
+   cur.lastrowid,REJECT_SHADOW_VERSION,'OPEN',symbol,'LONG',captured_at,plan['entry'],plan['initial_stop'],
+   plan['current_stop'],plan['qty'],plan['qty'],plan['initial_risk_usd'],float(score),
+   json.dumps(reasons,separators=(',',':')),m15.get('rsi'),btc_ratio,eth_ratio,score_data.get('volume_score'),
+   json.dumps(score_data,ensure_ascii=False,separators=(',',':')),
+   json.dumps(regime,ensure_ascii=False,separators=(',',':')),plan['entry_fee'],-plan['entry_fee'],captured_at,captured_at))
   c.execute('''INSERT INTO entry_filter_active_setups(symbol,side,rejection_id,reasons_json,first_seen_at,last_seen_at)
    VALUES(?,?,?,?,?,?)''',(symbol,'LONG',cur.lastrowid,json.dumps(reasons,separators=(',',':')),captured_at,captured_at))
   return 'CREATED'
@@ -884,6 +916,48 @@ async def _assert_live_fee_position_closed(client,symbol,position_id):
 
 def has_open(sym):
  c=db(); r=c.execute("SELECT 1 FROM positions WHERE status='OPEN' AND symbol=?",(sym,)).fetchone(); c.close(); return bool(r)
+def _current_entry_plan(sym,side,m):
+ p=float(m['15m']['price'])
+ dist=max(float(m['15m']['atr'])*float(settings['stop_atr_mult']),p*.002)
+ stop=p-dist if side=='LONG' else p+dist
+ qty=float(settings['risk_per_trade_usd'])/dist
+ cap=float(settings['max_btc_notional_usd'] if sym=='BTC_USDT' else settings['max_alt_notional_usd'])
+ qty=min(qty,cap/p)
+ fee_rate=max(float(settings.get('paper_fee_rate',0.0008) or 0),0.0)
+ return {'entry':p,'initial_stop':stop,'current_stop':stop,'qty':qty,
+  'initial_risk_usd':qty*dist,'entry_fee':p*qty*fee_rate}
+
+def _current_position_transition(position,price):
+ """Pure CURRENT TP/stop transition shared by PAPER and REJECT_SHADOW."""
+ p=float(price); entry=float(position['entry']); initial_stop=float(position['initial_stop'])
+ sign=1 if position['side']=='LONG' else -1
+ risk_distance=abs(entry-initial_stop)
+ progress=(p-entry)*sign/risk_distance if risk_distance else 0.0
+ result=dict(position)
+ result['mae']=max(float(position.get('mae') or 0),max(0.0,(entry-p)*sign))
+ result['mfe']=max(float(position.get('mfe') or 0),max(0.0,(p-entry)*sign))
+ result['mae_r']=max(float(position.get('mae_r') or 0),max(0.0,-progress))
+ result['mfe_r']=max(float(position.get('mfe_r') or 0),max(0.0,progress))
+ result['events']=[]; result['closed']=False; result['exit_price']=None
+ gross=float(position.get('gross_pnl') or 0); fees=float(position.get('fee_paid') or 0)
+ rem=float(position['remaining_qty']); stop=float(position['stop'])
+ fee_rate=max(float(settings.get('paper_fee_rate',0.0008) or 0),0.0)
+ if (position['side']=='LONG' and p<=stop) or (position['side']=='SHORT' and p>=stop):
+  gross+=(p-entry)*sign*rem; fees+=p*rem*fee_rate
+  result.update(closed=True,remaining_qty=0.0,gross_pnl=gross,fee_paid=fees,
+   net_pnl=gross-fees,exit_price=p,close_reason='STOP')
+  result['events'].append('STOP'); return result
+ if progress>=float(settings['tp1_r']) and not position.get('tp1_done'):
+  q=float(position['qty'])*float(settings['tp1_pct'])/100
+  gross+=(p-entry)*sign*q; fees+=p*q*fee_rate; rem-=q; stop=entry
+  result['tp1_done']=True; result['events'].append('TP1')
+ if progress>=float(settings['tp2_r']) and not position.get('tp2_done'):
+  q=min(float(position['qty'])*float(settings['tp2_pct'])/100,rem)
+  gross+=(p-entry)*sign*q; fees+=p*q*fee_rate; rem-=q; stop=entry+sign*risk_distance
+  result['tp2_done']=True; result['events'].append('TP2')
+ result.update(remaining_qty=rem,stop=stop,gross_pnl=gross,fee_paid=fees,net_pnl=gross-fees)
+ return result
+
 def paper_open(sym,side,m,sc,regime_snapshot=None):
  if state.get('entry_paused'):
   return
@@ -898,21 +972,15 @@ def paper_open(sym,side,m,sc,regime_snapshot=None):
  risk=float(settings['risk_per_trade_usd'])
  if open_risk()+risk>settings['max_total_open_risk_usd']:
   return
- p=m['15m']['price']
- dist=max(m['15m']['atr']*settings['stop_atr_mult'],p*.002)
- stop=p-dist if side=='LONG' else p+dist
- qty=risk/dist
- cap=settings['max_btc_notional_usd'] if sym=='BTC_USDT' else settings['max_alt_notional_usd']
- qty=min(qty,cap/p)
- actual=qty*dist
+ plan=_current_entry_plan(sym,side,m)
+ p=plan['entry']; stop=plan['initial_stop']; qty=plan['qty']; actual=plan['initial_risk_usd']
  leverage=max(float(settings.get('leverage',1) or 1),1.0)
  required_margin=(p*qty)/leverage
  available_margin=available_paper_margin()
  if required_margin>available_margin:
   log(f'{sym} {side} açılmadı | margin yetersiz: gereken ${required_margin:.2f}, kullanılabilir ${available_margin:.2f}','RISK')
   return
- fee_rate=max(float(settings.get('paper_fee_rate',0.0008) or 0),0.0)
- entry_fee=p*qty*fee_rate
+ entry_fee=plan['entry_fee']
  opened=datetime.now().isoformat(timespec='seconds')
  snapshot=score_snapshot(m,side,sc,opened)
  if regime_snapshot is None:
@@ -941,52 +1009,47 @@ def _manage_once(c):
   p=float((state.get('live_prices') or {}).get(pos['symbol']) or md.get('price') or 0)
   if p<=0:
    continue
-  sign=1 if pos['side']=='LONG' else -1
-  R=abs(pos['entry']-pos['initial_stop'])
-  prog=(p-pos['entry'])*sign/R if R else 0
-  pnl=float(pos['pnl'] or 0)
-  fee_paid=float(pos['fee_paid'] or 0)
-  # MAE = worst adverse excursion in R; MFE = best favorable excursion in R.
-  # For positions that existed before Faz 1.8.1 this is partial, starting at upgrade time.
-  mae_r=max(float(pos['mae_r'] or 0),max(0.0,-prog))
-  mfe_r=max(float(pos['mfe_r'] or 0),max(0.0,prog))
-  c.execute("UPDATE positions SET mae_r=?,mfe_r=? WHERE id=? AND status='OPEN'",(mae_r,mfe_r,pos['id']))
-  fee_rate=max(float(settings.get('paper_fee_rate',0.0008) or 0),0.0)
-  rem=pos['remaining_qty']
-  stop=pos['stop']
-  if (pos['side']=='LONG' and p<=stop) or (pos['side']=='SHORT' and p>=stop):
-   pnl+=(p-pos['entry'])*sign*rem
-   exit_fee=p*rem*fee_rate; pnl-=exit_fee; fee_paid+=exit_fee
+  data=dict(pos); data.update(entry=pos['entry'],stop=pos['stop'],gross_pnl=float(pos['pnl'] or 0)+float(pos['fee_paid'] or 0))
+  result=_current_position_transition(data,p)
+  if result['closed']:
    c.execute(
     "UPDATE positions SET status='CLOSED',remaining_qty=0,closed_at=?,pnl=?,close_price=?,fee_paid=?,close_reason='STOP',mae_r=?,mfe_r=? WHERE id=? AND status='OPEN'",
-    (datetime.now().isoformat(timespec='seconds'),pnl,p,fee_paid,mae_r,mfe_r,pos['id'])
+    (datetime.now().isoformat(timespec='seconds'),result['net_pnl'],p,result['fee_paid'],result['mae_r'],result['mfe_r'],pos['id'])
    )
-   events.append((f"{pos['symbol']} kapandı | PnL ${pnl:.2f}",'TRADE'))
+   events.append((f"{pos['symbol']} kapandı | PnL ${result['net_pnl']:.2f}",'TRADE'))
    continue
-  if prog>=settings['tp1_r'] and not pos['tp1_done']:
-   q=pos['qty']*settings['tp1_pct']/100
-   pnl+=(p-pos['entry'])*sign*q
-   exit_fee=p*q*fee_rate; pnl-=exit_fee; fee_paid+=exit_fee
-   rem-=q
-   c.execute(
-    'UPDATE positions SET tp1_done=1,remaining_qty=?,pnl=?,stop=?,fee_paid=? WHERE id=? AND status=\'OPEN\'',
-    (rem,pnl,pos['entry'],fee_paid,pos['id'])
-   )
-   events.append((f"{pos['symbol']} TP1",'TRADE'))
-  if prog>=settings['tp2_r'] and not pos['tp2_done']:
-   q=min(pos['qty']*settings['tp2_pct']/100,rem)
-   pnl+=(p-pos['entry'])*sign*q
-   exit_fee=p*q*fee_rate; pnl-=exit_fee; fee_paid+=exit_fee
-   rem-=q
-   c.execute(
-    'UPDATE positions SET tp2_done=1,remaining_qty=?,pnl=?,stop=?,fee_paid=? WHERE id=? AND status=\'OPEN\'',
-    (rem,pnl,pos['entry']+sign*R,fee_paid,pos['id'])
-   )
-   events.append((f"{pos['symbol']} TP2",'TRADE'))
+  c.execute('''UPDATE positions SET tp1_done=?,tp2_done=?,remaining_qty=?,pnl=?,stop=?,fee_paid=?,mae_r=?,mfe_r=?
+   WHERE id=? AND status='OPEN' ''',(int(bool(result.get('tp1_done'))),int(bool(result.get('tp2_done'))),
+   result['remaining_qty'],result['net_pnl'],result['stop'],result['fee_paid'],result['mae_r'],result['mfe_r'],pos['id']))
+  for event in result['events']:events.append((f"{pos['symbol']} {event}",'TRADE'))
  return events
+
+def _manage_reject_shadows_once(c):
+ rows=c.execute("SELECT * FROM reject_shadow_trades WHERE status='OPEN'").fetchall()
+ for row in rows:
+  md=state.get('market',{}).get(row['symbol']) or {}
+  price=float((state.get('live_prices') or {}).get(row['symbol']) or md.get('price') or 0)
+  if price<=0:continue
+  data=dict(row); data.update(entry=row['entry_price'],stop=row['current_stop'],
+   tp1_done=row['tp1_hit'],tp2_done=row['tp2_hit'],gross_pnl=row['gross_simulated_pnl'],fee_paid=row['simulated_fee'])
+  result=_current_position_transition(data,price); now=datetime.now().isoformat(timespec='seconds')
+  if result['closed']:
+   net=result['net_pnl']; filter_result='AVOIDED_LOSS' if net<0 else ('MISSED_PROFIT' if net>0 else 'BREAK_EVEN')
+   c.execute('''UPDATE reject_shadow_trades SET status='CLOSED',close_at=?,exit_price=?,remaining_qty=0,
+    current_stop=?,mae=?,mae_r=?,mfe=?,mfe_r=?,tp1_hit=?,tp2_hit=?,gross_simulated_pnl=?,simulated_fee=?,
+    net_simulated_pnl=?,final_exit_reason=?,filter_result=?,avoided_loss=?,missed_profit=?,updated_at=? WHERE id=? AND status='OPEN' ''',
+    (now,result['exit_price'],result['stop'],result['mae'],result['mae_r'],result['mfe'],result['mfe_r'],
+     int(bool(result.get('tp1_done'))),int(bool(result.get('tp2_done'))),result['gross_pnl'],result['fee_paid'],net,
+     result['close_reason'],filter_result,max(0.0,-net),max(0.0,net),now,row['id']))
+  else:
+   c.execute('''UPDATE reject_shadow_trades SET remaining_qty=?,current_stop=?,mae=?,mae_r=?,mfe=?,mfe_r=?,
+    tp1_hit=?,tp2_hit=?,gross_simulated_pnl=?,simulated_fee=?,net_simulated_pnl=?,updated_at=? WHERE id=? AND status='OPEN' ''',
+    (result['remaining_qty'],result['stop'],result['mae'],result['mae_r'],result['mfe'],result['mfe_r'],
+     int(bool(result.get('tp1_done'))),int(bool(result.get('tp2_done'))),result['gross_pnl'],result['fee_paid'],result['net_pnl'],now,row['id']))
 
 def manage():
  events=_sqlite_write_with_retry(_manage_once)
+ _sqlite_write_with_retry(_manage_reject_shadows_once)
  for message,level in events:
   log(message,level)
 
@@ -1361,6 +1424,7 @@ async def position_engine():
    try:
     c=db()
     open_syms=[x['symbol'] for x in c.execute("SELECT DISTINCT symbol FROM positions WHERE status='OPEN'").fetchall()]
+    open_syms += [x['symbol'] for x in c.execute("SELECT DISTINCT symbol FROM reject_shadow_trades WHERE status='OPEN'").fetchall()]
     c.close()
     open_syms=list(dict.fromkeys(open_syms+strategy_lab_open_symbols()))
     if open_syms:
@@ -1498,14 +1562,28 @@ def status():
 
 @app.get('/api/entry-filter-rejections')
 def entry_filter_rejections():
- c=db(); rows=[dict(x) for x in c.execute('''SELECT * FROM entry_filter_rejections
-  WHERE filter_version=? ORDER BY id DESC LIMIT 500''',(ENTRY_QUALITY_FILTER_VERSION,)).fetchall()]; c.close()
+ c=db(); rows=[dict(x) for x in c.execute('''SELECT r.*,s.status AS shadow_status,s.entry_price AS shadow_entry_price,
+  s.exit_price AS shadow_exit_price,s.mae_r AS shadow_mae_r,s.mfe_r AS shadow_mfe_r,
+  s.tp1_hit AS shadow_tp1_hit,s.tp2_hit AS shadow_tp2_hit,s.final_exit_reason AS shadow_exit_reason,
+  s.net_simulated_pnl AS shadow_net_pnl,s.filter_result AS shadow_filter_result
+  FROM entry_filter_rejections r LEFT JOIN reject_shadow_trades s ON s.rejection_id=r.id
+  WHERE r.filter_version=? ORDER BY r.id DESC LIMIT 500''',(ENTRY_QUALITY_FILTER_VERSION,)).fetchall()]
+ shadow_summary=dict(c.execute('''SELECT COUNT(*) AS total,
+  COALESCE(SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END),0) AS open_count,
+  COALESCE(SUM(CASE WHEN status='CLOSED' THEN 1 ELSE 0 END),0) AS closed_count,
+  COALESCE(SUM(CASE WHEN filter_result='AVOIDED_LOSS' THEN 1 ELSE 0 END),0) AS avoided_loss_count,
+  COALESCE(SUM(avoided_loss),0) AS avoided_loss_usd,
+  COALESCE(SUM(CASE WHEN filter_result='MISSED_PROFIT' THEN 1 ELSE 0 END),0) AS missed_profit_count,
+  COALESCE(SUM(missed_profit),0) AS missed_profit_usd,
+  COALESCE(-SUM(CASE WHEN status='CLOSED' THEN net_simulated_pnl ELSE 0 END),0) AS net_filter_impact
+  FROM reject_shadow_trades''').fetchone()); c.close()
  reason_counts={}
  for row in rows:
   row['reasons']=json.loads(row.pop('reasons_json'))
   for reason in row['reasons']:reason_counts[reason]=reason_counts.get(reason,0)+1
   row.pop('score_snapshot_json',None); row.pop('market_regime_snapshot_json',None)
- return {'filter_version':ENTRY_QUALITY_FILTER_VERSION,'total':len(rows),'reason_counts':reason_counts,'rows':rows}
+ return {'filter_version':ENTRY_QUALITY_FILTER_VERSION,'shadow_version':REJECT_SHADOW_VERSION,
+  'total':len(rows),'reason_counts':reason_counts,'shadow_summary':shadow_summary,'rows':rows}
 
 @app.get('/api/history')
 def history(period: str='all'):

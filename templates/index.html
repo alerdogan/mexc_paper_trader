@@ -160,11 +160,16 @@
   <div class="card"><div class="muted">BTC 15m Hacim &lt; 0.55</div><div class="big" id="entryFilterBtcVolume">—</div></div>
   <div class="card"><div class="muted">ETH 15m Hacim &lt; 0.55</div><div class="big" id="entryFilterEthVolume">—</div></div>
   <div class="card"><div class="muted">Coin Volume Score = 0</div><div class="big" id="entryFilterCoinVolume">—</div></div>
+  <div class="card"><div class="muted">OPEN Shadow</div><div class="big" id="entryFilterShadowOpen">—</div></div>
+  <div class="card"><div class="muted">CLOSED Shadow</div><div class="big" id="entryFilterShadowClosed">—</div></div>
+  <div class="card"><div class="muted">Avoided Loss</div><div class="big" id="entryFilterAvoided">—</div><div class="muted" id="entryFilterAvoidedUsd">—</div></div>
+  <div class="card"><div class="muted">Missed Profit</div><div class="big" id="entryFilterMissed">—</div><div class="muted" id="entryFilterMissedUsd">—</div></div>
+  <div class="card"><div class="muted">Net Ekonomik Etki</div><div class="big" id="entryFilterImpact">—</div></div>
  </div>
  <section class="card">
   <h2>ENTRY FILTER <span class="badge paper">ENTRY_QUALITY_FILTER_V1</span></h2>
   <div id="entryFilterMsg" class="muted" style="margin-bottom:12px">Reddedilen LONG sinyalleri yükleniyor…</div>
-  <div style="overflow:auto"><table><thead><tr><th>Tarih / Saat</th><th>Coin</th><th>Yön</th><th>Signal Score</th><th>RSI</th><th>BTC 15m Volume</th><th>ETH 15m Volume</th><th>Coin Volume Score</th><th>Reject Nedeni / Nedenleri</th></tr></thead><tbody id="entryFilterRows"></tbody></table></div>
+  <div style="overflow:auto"><table><thead><tr><th>Tarih / Saat</th><th>Coin</th><th>Yön</th><th>Signal Score</th><th>RSI</th><th>BTC 15m Volume</th><th>ETH 15m Volume</th><th>Coin Volume Score</th><th>Reject Nedeni / Nedenleri</th><th>Shadow Status</th><th>MFE R</th><th>MAE R</th><th>TP1</th><th>TP2</th><th>Shadow Exit</th><th>Shadow Net PnL</th><th>Filter Result</th></tr></thead><tbody id="entryFilterRows"></tbody></table></div>
  </section>
 </div>
 
@@ -270,7 +275,8 @@ async function loadEntryFilter(){
   let r=await fetch('/api/entry-filter-rejections'),d=await r.json();if(!r.ok)throw new Error(d.detail||r.status);
   let counts=d.reason_counts||{},reasonLabels={COIN_RSI_GTE_64:'Coin RSI ≥ 64',BTC_15M_VOLUME_RATIO_LT_0_55:'BTC 15m volume ratio < 0.55',ETH_15M_VOLUME_RATIO_LT_0_55:'ETH 15m volume ratio < 0.55',COIN_VOLUME_SCORE_EQ_0:'Coin volume score = 0'};
   entryFilterTotal.textContent=fmt(d.total,0);entryFilterRsi.textContent=fmt(counts.COIN_RSI_GTE_64,0);entryFilterBtcVolume.textContent=fmt(counts.BTC_15M_VOLUME_RATIO_LT_0_55,0);entryFilterEthVolume.textContent=fmt(counts.ETH_15M_VOLUME_RATIO_LT_0_55,0);entryFilterCoinVolume.textContent=fmt(counts.COIN_VOLUME_SCORE_EQ_0,0);
-  entryFilterRows.innerHTML=(d.rows||[]).map(x=>`<tr><td>${x.rejected_at||'—'}</td><td><b>${x.symbol||'—'}</b></td><td class="long">${x.side||'—'}</td><td>${fmt(x.score,0)}</td><td>${x.coin_rsi==null?'—':fmt(x.coin_rsi,2)}</td><td>${x.btc_15m_volume_ratio==null?'—':fmt(x.btc_15m_volume_ratio,3)}</td><td>${x.eth_15m_volume_ratio==null?'—':fmt(x.eth_15m_volume_ratio,3)}</td><td>${x.coin_volume_score==null?'—':fmt(x.coin_volume_score,0)}</td><td>${(x.reasons||[]).map(reason=>reasonLabels[reason]||reason).join('<br>')||'—'}</td></tr>`).join('')||'<tr><td colspan="9" class="muted">Henüz reddedilmiş LONG sinyali yok.</td></tr>';
+  let ss=d.shadow_summary||{};entryFilterShadowOpen.textContent=fmt(ss.open_count,0);entryFilterShadowClosed.textContent=fmt(ss.closed_count,0);entryFilterAvoided.textContent=fmt(ss.avoided_loss_count,0);entryFilterAvoidedUsd.textContent=money(ss.avoided_loss_usd||0);entryFilterMissed.textContent=fmt(ss.missed_profit_count,0);entryFilterMissedUsd.textContent=money(ss.missed_profit_usd||0);entryFilterImpact.textContent=money(ss.net_filter_impact||0);entryFilterImpact.className='big '+cls(ss.net_filter_impact||0);
+  entryFilterRows.innerHTML=(d.rows||[]).map(x=>{let shadow=x.shadow_status!=null,fr=x.shadow_filter_result==='AVOIDED_LOSS'?'AVOIDED LOSS':x.shadow_filter_result==='MISSED_PROFIT'?'MISSED PROFIT':x.shadow_filter_result==='OPEN'?'OPEN':(x.shadow_filter_result||'N/A');return `<tr><td>${x.rejected_at||'—'}</td><td><b>${x.symbol||'—'}</b></td><td class="long">${x.side||'—'}</td><td>${fmt(x.score,0)}</td><td>${x.coin_rsi==null?'—':fmt(x.coin_rsi,2)}</td><td>${x.btc_15m_volume_ratio==null?'—':fmt(x.btc_15m_volume_ratio,3)}</td><td>${x.eth_15m_volume_ratio==null?'—':fmt(x.eth_15m_volume_ratio,3)}</td><td>${x.coin_volume_score==null?'—':fmt(x.coin_volume_score,0)}</td><td>${(x.reasons||[]).map(reason=>reasonLabels[reason]||reason).join('<br>')||'—'}</td><td>${x.shadow_status||'N/A'}</td><td>${shadow?fmt(x.shadow_mfe_r,2)+'R':'N/A'}</td><td>${shadow?fmt(x.shadow_mae_r,2)+'R':'N/A'}</td><td>${shadow?(x.shadow_tp1_hit?'✓':'—'):'N/A'}</td><td>${shadow?(x.shadow_tp2_hit?'✓':'—'):'N/A'}</td><td>${shadow?(x.shadow_exit_reason||'—'):'N/A'}</td><td class="${shadow?cls(x.shadow_net_pnl):''}">${shadow?money(x.shadow_net_pnl):'N/A'}</td><td class="${fr==='AVOIDED LOSS'?'pos':fr==='MISSED PROFIT'?'neg':''}"><b>${fr}</b></td></tr>`}).join('')||'<tr><td colspan="17" class="muted">Henüz reddedilmiş LONG sinyali yok.</td></tr>';
   entryFilterMsg.textContent=`${d.filter_version||'ENTRY_QUALITY_FILTER_V1'} · Her sinyal toplamda bir kez sayılır; birden fazla reject nedeni aynı satırda birlikte gösterilir.`;
  }catch(e){entryFilterMsg.textContent='ENTRY FILTER verisi alınamadı: '+e.message}
 }
