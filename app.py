@@ -22,6 +22,7 @@ MARKET_REGIME_SNAPSHOT_VERSION='1.0'
 ENTRY_QUALITY_FILTER_VERSION='ENTRY_QUALITY_FILTER_V1'
 REJECT_SHADOW_VERSION='REJECT_SHADOW_V1'
 POST_ENTRY_FILTER_COHORT='POST_ENTRY_FILTER_V1'
+ENTRY_QUALITY_FILTER_V2_RESEARCH_VERSION='ENTRY_QUALITY_FILTER_V2_RESEARCH'
 # Verified from systemd journal: filter-bearing process startup completed at this UTC instant.
 ENTRY_QUALITY_FILTER_V1_DEPLOYED_AT='2026-09-04T07:45:28'
 SUPERVISOR_BACKOFF=(1,2,5,10,30)
@@ -165,6 +166,23 @@ def init_db():
   FOREIGN KEY(rejection_id) REFERENCES entry_filter_rejections(id)
  )''')
  c.execute('CREATE INDEX IF NOT EXISTS idx_reject_shadow_status ON reject_shadow_trades(status)')
+ c.execute('''CREATE TABLE IF NOT EXISTS entry_quality_filter_v2_research_meta(
+  version TEXT PRIMARY KEY,deployed_at TEXT NOT NULL
+ )''')
+ c.execute('''INSERT OR IGNORE INTO entry_quality_filter_v2_research_meta(version,deployed_at)
+  VALUES(?,?)''',(ENTRY_QUALITY_FILTER_V2_RESEARCH_VERSION,datetime.now().isoformat(timespec='seconds')))
+ c.execute('''CREATE TABLE IF NOT EXISTS entry_quality_filter_v2_research(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,position_id INTEGER NOT NULL UNIQUE,version TEXT NOT NULL,
+  symbol TEXT NOT NULL,side TEXT NOT NULL,opened_at TEXT NOT NULL,score REAL,
+  rsi REAL,coin_volume_ratio REAL,resistance_distance_pct REAL,support_distance_pct REAL,
+  bullish_pct REAL,bearish_pct REAL,btc_15m_volume_ratio REAL,eth_15m_volume_ratio REAL,
+  trend_15m INTEGER,trend_1h INTEGER,trend_4h INTEGER,matched_rules_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'OPEN',tp1_hit INTEGER NOT NULL DEFAULT 0,tp2_hit INTEGER NOT NULL DEFAULT 0,
+  mae_r REAL NOT NULL DEFAULT 0,mfe_r REAL NOT NULL DEFAULT 0,close_reason TEXT,final_net_pnl REAL,
+  closed_at TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,
+  FOREIGN KEY(position_id) REFERENCES positions(id)
+ )''')
+ c.execute('CREATE INDEX IF NOT EXISTS idx_entry_quality_v2_status ON entry_quality_filter_v2_research(status)')
  # Existing open positions can only be tracked accurately from this upgrade forward.
  now_iso=datetime.now().isoformat(timespec='seconds')
  c.execute("UPDATE positions SET tracking_started_at=? WHERE status='OPEN' AND tracking_started_at IS NULL",(now_iso,))
@@ -919,6 +937,31 @@ async def _assert_live_fee_position_closed(client,symbol,position_id):
 
 def has_open(sym):
  c=db(); r=c.execute("SELECT 1 FROM positions WHERE status='OPEN' AND symbol=?",(sym,)).fetchone(); c.close(); return bool(r)
+def _entry_quality_v2_rules(score_data,regime):
+ if str(score_data.get('signal_side') or '')!='LONG' or float(regime.get('bullish_pct') or 0)<60:
+  return []
+ rules=[]
+ btc=regime.get('btc_15m_volume_ratio'); eth=regime.get('eth_15m_volume_ratio')
+ resistance=score_data.get('resistance_distance_pct')
+ if btc is not None and float(btc)<1.0:rules.append('RULE_A')
+ if resistance is not None and float(resistance)<1.5:rules.append('RULE_B')
+ if eth is not None and float(eth)<1.0:rules.append('RULE_C')
+ return rules
+
+def _insert_entry_quality_v2_research(c,position_id,symbol,side,opened,score,score_data,regime):
+ if side!='LONG':return
+ rules=_entry_quality_v2_rules(score_data,regime)
+ c.execute('''INSERT OR IGNORE INTO entry_quality_filter_v2_research(
+  position_id,version,symbol,side,opened_at,score,rsi,coin_volume_ratio,resistance_distance_pct,
+  support_distance_pct,bullish_pct,bearish_pct,btc_15m_volume_ratio,eth_15m_volume_ratio,
+  trend_15m,trend_1h,trend_4h,matched_rules_json,created_at,updated_at
+  ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(
+  position_id,ENTRY_QUALITY_FILTER_V2_RESEARCH_VERSION,symbol,side,opened,float(score),
+  score_data.get('rsi_value'),score_data.get('volume_ratio'),score_data.get('resistance_distance_pct'),
+  score_data.get('support_distance_pct'),regime.get('bullish_pct'),regime.get('bearish_pct'),
+  regime.get('btc_15m_volume_ratio'),regime.get('eth_15m_volume_ratio'),score_data.get('trend_15m'),
+  score_data.get('trend_1h'),score_data.get('trend_4h'),json.dumps(rules,separators=(',',':')),opened,opened))
+
 def _current_entry_plan(sym,side,m):
  p=float(m['15m']['price'])
  dist=max(float(m['15m']['atr'])*float(settings['stop_atr_mult']),p*.002)
@@ -996,6 +1039,7 @@ def paper_open(sym,side,m,sc,regime_snapshot=None):
   cur=c.execute('''INSERT INTO positions(symbol,side,status,entry,stop,initial_stop,qty,remaining_qty,risk_usd,score,opened_at,pnl,fee_paid,mae_r,mfe_r,tracking_started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(sym,side,'OPEN',p,stop,stop,qty,qty,actual,sc,opened,-entry_fee,entry_fee,0.0,0.0,opened))
   _insert_score_snapshot(c,cur.lastrowid,snapshot)
   _insert_market_regime_snapshot(c,cur.lastrowid,regime_snapshot)
+  _insert_entry_quality_v2_research(c,cur.lastrowid,sym,side,opened,sc,snapshot,regime_snapshot)
   return cur.lastrowid
  position_id=_sqlite_write_with_retry(write)
  try:
@@ -1050,9 +1094,25 @@ def _manage_reject_shadows_once(c):
     (result['remaining_qty'],result['stop'],result['mae'],result['mae_r'],result['mfe'],result['mfe_r'],
      int(bool(result.get('tp1_done'))),int(bool(result.get('tp2_done'))),result['gross_pnl'],result['fee_paid'],result['net_pnl'],now,row['id']))
 
+def _sync_entry_quality_v2_research_once(c):
+ now=datetime.now().isoformat(timespec='seconds')
+ c.execute('''UPDATE entry_quality_filter_v2_research AS v SET
+  status=(SELECT p.status FROM positions p WHERE p.id=v.position_id),
+  tp1_hit=COALESCE((SELECT p.tp1_done FROM positions p WHERE p.id=v.position_id),tp1_hit),
+  tp2_hit=COALESCE((SELECT p.tp2_done FROM positions p WHERE p.id=v.position_id),tp2_hit),
+  mae_r=COALESCE((SELECT p.mae_r FROM positions p WHERE p.id=v.position_id),mae_r),
+  mfe_r=COALESCE((SELECT p.mfe_r FROM positions p WHERE p.id=v.position_id),mfe_r),
+  close_reason=(SELECT p.close_reason FROM positions p WHERE p.id=v.position_id),
+  final_net_pnl=CASE WHEN (SELECT p.status FROM positions p WHERE p.id=v.position_id)='CLOSED'
+   THEN (SELECT p.pnl FROM positions p WHERE p.id=v.position_id) ELSE NULL END,
+  closed_at=CASE WHEN (SELECT p.status FROM positions p WHERE p.id=v.position_id)='CLOSED'
+   THEN (SELECT p.closed_at FROM positions p WHERE p.id=v.position_id) ELSE NULL END,
+  updated_at=? WHERE EXISTS(SELECT 1 FROM positions p WHERE p.id=v.position_id)''',(now,))
+
 def manage():
  events=_sqlite_write_with_retry(_manage_once)
  _sqlite_write_with_retry(_manage_reject_shadows_once)
+ _sqlite_write_with_retry(_sync_entry_quality_v2_research_once)
  for message,level in events:
   log(message,level)
 
@@ -1640,6 +1700,33 @@ def _reject_shadow_metrics(rows):
   'avoided_loss_usd':sum(float(x.get('avoided_loss') or 0) for x in avoided),
   'missed_profit_count':len(missed),'missed_profit_usd':sum(float(x.get('missed_profit') or 0) for x in missed),
   'net_filter_impact':-sum(net),'expectancy':sum(net)/len(closed) if closed else 0.0}
+
+def _v2_research_metrics(rows):
+ rows=[dict(x) for x in rows]; closed=[x for x in rows if x.get('status')=='CLOSED']
+ pnls=[float(x.get('final_net_pnl') or 0) for x in closed]
+ wins=sum(x>0 for x in pnls); losses=sum(x<0 for x in pnls)
+ initial=sum(x.get('close_reason') in ('STOP','STOP_INFERRED') and not x.get('tp1_hit') and not x.get('tp2_hit') for x in closed)
+ return {'total':len(rows),'open':len(rows)-len(closed),'closed':len(closed),'wins':wins,'losses':losses,
+  'win_rate':_safe_rate(wins,len(closed)),'initial_stop_count':initial,
+  'initial_stop_rate':_safe_rate(initial,len(closed)),
+  'tp1_rate':_safe_rate(sum(bool(x.get('tp1_hit')) for x in closed),len(closed)),
+  'tp2_rate':_safe_rate(sum(bool(x.get('tp2_hit')) for x in closed),len(closed)),
+  'total_pnl':sum(pnls),'expectancy':sum(pnls)/len(closed) if closed else 0.0,
+  'hypothetical_filter_impact':-sum(pnls)}
+
+@app.get('/api/entry-quality-filter-v2-research')
+def entry_quality_filter_v2_research():
+ c=db()
+ meta=c.execute('SELECT deployed_at FROM entry_quality_filter_v2_research_meta WHERE version=?',
+  (ENTRY_QUALITY_FILTER_V2_RESEARCH_VERSION,)).fetchone()
+ rows=[dict(x) for x in c.execute('SELECT * FROM entry_quality_filter_v2_research ORDER BY id').fetchall()]; c.close()
+ for row in rows:row['matched_rules']=json.loads(row.pop('matched_rules_json'))
+ groups={rule:_v2_research_metrics([x for x in rows if rule in x['matched_rules']]) for rule in ('RULE_A','RULE_B','RULE_C')}
+ any_rule=[x for x in rows if x['matched_rules']]; no_rule=[x for x in rows if not x['matched_rules']]
+ return {'version':ENTRY_QUALITY_FILTER_V2_RESEARCH_VERSION,
+  'deployed_at':meta['deployed_at']+'Z' if meta else None,'rules':groups,
+  'any_v2_rule':_v2_research_metrics(any_rule),'no_v2_rule':_v2_research_metrics(no_rule),
+  'rows':list(reversed(rows[-200:]))}
 
 @app.get('/api/post-filter-analytics')
 def post_filter_analytics():
