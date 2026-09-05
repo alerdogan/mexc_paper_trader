@@ -21,6 +21,9 @@ SCORE_SNAPSHOT_VERSION='1.0'
 MARKET_REGIME_SNAPSHOT_VERSION='1.0'
 ENTRY_QUALITY_FILTER_VERSION='ENTRY_QUALITY_FILTER_V1'
 REJECT_SHADOW_VERSION='REJECT_SHADOW_V1'
+POST_ENTRY_FILTER_COHORT='POST_ENTRY_FILTER_V1'
+# Verified from systemd journal: filter-bearing process startup completed at this UTC instant.
+ENTRY_QUALITY_FILTER_V1_DEPLOYED_AT='2026-09-04T07:45:28'
 SUPERVISOR_BACKOFF=(1,2,5,10,30)
 background_tasks={}
 live_fee_test_lock=asyncio.Lock()
@@ -1576,14 +1579,83 @@ def entry_filter_rejections():
   COALESCE(SUM(CASE WHEN filter_result='MISSED_PROFIT' THEN 1 ELSE 0 END),0) AS missed_profit_count,
   COALESCE(SUM(missed_profit),0) AS missed_profit_usd,
   COALESCE(-SUM(CASE WHEN status='CLOSED' THEN net_simulated_pnl ELSE 0 END),0) AS net_filter_impact
-  FROM reject_shadow_trades''').fetchone()); c.close()
+  FROM reject_shadow_trades''').fetchone())
+ shadow_rows=[dict(x) for x in c.execute('SELECT * FROM reject_shadow_trades').fetchall()]; c.close()
  reason_counts={}
  for row in rows:
   row['reasons']=json.loads(row.pop('reasons_json'))
   for reason in row['reasons']:reason_counts[reason]=reason_counts.get(reason,0)+1
   row.pop('score_snapshot_json',None); row.pop('market_regime_snapshot_json',None)
  return {'filter_version':ENTRY_QUALITY_FILTER_VERSION,'shadow_version':REJECT_SHADOW_VERSION,
-  'total':len(rows),'reason_counts':reason_counts,'shadow_summary':shadow_summary,'rows':rows}
+  'total':len(rows),'reason_counts':reason_counts,'shadow_summary':shadow_summary,
+  'shadow_comparison':{'all_symbols':_reject_shadow_metrics(shadow_rows),
+   'aster_excluded':_reject_shadow_metrics([x for x in shadow_rows if x.get('symbol')!='ASTER_USDT'])},'rows':rows}
+
+def _safe_rate(numerator,denominator):
+ return float(numerator)/float(denominator)*100 if denominator else 0.0
+
+def _profit_factor(pnls):
+ gains=sum(x for x in pnls if x>0); losses=-sum(x for x in pnls if x<0)
+ return gains/losses if losses else (None if gains else 0.0)
+
+def _max_drawdown(pnls):
+ equity=peak=drawdown=0.0
+ for pnl in pnls:
+  equity+=pnl; peak=max(peak,equity); drawdown=max(drawdown,peak-equity)
+ return drawdown
+
+def _position_metrics(rows):
+ rows=[dict(x) for x in rows]; closed=[x for x in rows if x.get('status')=='CLOSED']
+ pnls=[float(x.get('pnl') or 0) for x in closed]
+ fees=sum(float(x.get('fee_paid') or 0) for x in closed)
+ wins=sum(x>0 for x in pnls); losses=sum(x<0 for x in pnls)
+ is_stop=lambda x:x.get('close_reason') in ('STOP','STOP_INFERRED')
+ initial_stops=sum(is_stop(x) and not x.get('tp1_done') and not x.get('tp2_done') for x in closed)
+ tp1=sum(bool(x.get('tp1_done')) for x in rows); tp2=sum(bool(x.get('tp2_done')) for x in rows)
+ return {
+  'count':len(rows),'open':len(rows)-len(closed),'closed':len(closed),'wins':wins,'losses':losses,
+  'win_rate':_safe_rate(wins,len(closed)),'gross_pnl':sum(pnls)+fees,'fees':fees,'net_pnl':sum(pnls),
+  'expectancy':sum(pnls)/len(closed) if closed else 0.0,'profit_factor':_profit_factor(pnls),
+  'max_drawdown':_max_drawdown(pnls),'initial_stop_count':initial_stops,
+  'initial_stop_rate':_safe_rate(initial_stops,len(closed)),'tp1_reached_count':tp1,
+  'tp1_reached_rate':_safe_rate(tp1,len(rows)),'tp2_reached_count':tp2,
+  'tp2_reached_rate':_safe_rate(tp2,len(rows)),
+  'tp1_then_stop_count':sum(is_stop(x) and x.get('tp1_done') and not x.get('tp2_done') for x in closed),
+  'tp2_protective_stop_count':sum(is_stop(x) and x.get('tp2_done') for x in closed),
+  'average_mae_r':sum(float(x.get('mae_r') or 0) for x in rows)/len(rows) if rows else 0.0,
+  'average_mfe_r':sum(float(x.get('mfe_r') or 0) for x in rows)/len(rows) if rows else 0.0,
+  'net_pnl_per_trade':sum(pnls)/len(closed) if closed else 0.0,
+ }
+
+def _split_position_metrics(rows,key):
+ values=sorted({str(x[key]) for x in rows})
+ return {value:_position_metrics([x for x in rows if str(x[key])==value]) for value in values}
+
+def _reject_shadow_metrics(rows):
+ closed=[dict(x) for x in rows if x['status']=='CLOSED']
+ net=[float(x.get('net_simulated_pnl') or 0) for x in closed]
+ avoided=[x for x in closed if x.get('filter_result')=='AVOIDED_LOSS']
+ missed=[x for x in closed if x.get('filter_result')=='MISSED_PROFIT']
+ return {'closed':len(closed),'avoided_loss_count':len(avoided),
+  'avoided_loss_usd':sum(float(x.get('avoided_loss') or 0) for x in avoided),
+  'missed_profit_count':len(missed),'missed_profit_usd':sum(float(x.get('missed_profit') or 0) for x in missed),
+  'net_filter_impact':-sum(net),'expectancy':sum(net)/len(closed) if closed else 0.0}
+
+@app.get('/api/post-filter-analytics')
+def post_filter_analytics():
+ c=db()
+ positions=[dict(x) for x in c.execute("SELECT * FROM positions WHERE mode='PAPER' ORDER BY opened_at,id").fetchall()]
+ shadows=[dict(x) for x in c.execute('SELECT * FROM reject_shadow_trades').fetchall()]
+ c.close()
+ post=[x for x in positions if str(x.get('opened_at') or '')>ENTRY_QUALITY_FILTER_V1_DEPLOYED_AT]
+ pre=[x for x in positions if str(x.get('opened_at') or '')<=ENTRY_QUALITY_FILTER_V1_DEPLOYED_AT]
+ post_metrics=_position_metrics(post); pre_metrics=_position_metrics(pre)
+ return {'cohort':POST_ENTRY_FILTER_COHORT,'deploy_timestamp':ENTRY_QUALITY_FILTER_V1_DEPLOYED_AT+'Z',
+  'post_start_exclusive':ENTRY_QUALITY_FILTER_V1_DEPLOYED_AT+'Z','post':post_metrics,'pre':pre_metrics,
+  'comparison':{'pre':pre_metrics,'post':post_metrics},
+  'by_side':_split_position_metrics(post,'side'),'by_symbol':_split_position_metrics(post,'symbol'),
+  'shadows':{'all_symbols':_reject_shadow_metrics(shadows),
+   'aster_excluded':_reject_shadow_metrics([x for x in shadows if x.get('symbol')!='ASTER_USDT'])}}
 
 @app.get('/api/history')
 def history(period: str='all'):
