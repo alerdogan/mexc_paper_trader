@@ -27,6 +27,10 @@ REJECT_SHADOW_VERSION='REJECT_SHADOW_V1'
 POST_ENTRY_FILTER_COHORT='POST_ENTRY_FILTER_V1'
 ENTRY_QUALITY_FILTER_V2_RESEARCH_VERSION='ENTRY_QUALITY_FILTER_V2_RESEARCH'
 ENTRY_QUALITY_FILTER_V3_RESEARCH_VERSION='ENTRY_QUALITY_FILTER_V3_RESEARCH'
+ENTRY_TIMING_LAB_VERSION='CONFIRMED_5M_ENTRY_V1'
+ENTRY_TIMING_LAB_MODEL='CONFIRMED_5M_ENTRY'
+ENTRY_TIMING_CONFIRMATION_SECONDS=30*60
+ENTRY_TIMING_CHASE_R=0.75
 # Verified from systemd journal: filter-bearing process startup completed at this UTC instant.
 ENTRY_QUALITY_FILTER_V1_DEPLOYED_AT='2026-09-04T07:45:28'
 SUPERVISOR_BACKOFF=(1,2,5,10,30)
@@ -213,6 +217,35 @@ def init_db():
   FOREIGN KEY(position_id) REFERENCES positions(id)
  )''')
  c.execute('CREATE INDEX IF NOT EXISTS idx_entry_quality_v3_status ON entry_quality_filter_v3_research(status)')
+ c.execute('''CREATE TABLE IF NOT EXISTS entry_timing_lab_meta(
+  version TEXT PRIMARY KEY,deployed_at TEXT NOT NULL
+ )''')
+ c.execute('''INSERT OR IGNORE INTO entry_timing_lab_meta(version,deployed_at) VALUES(?,?)''',
+  (ENTRY_TIMING_LAB_VERSION,datetime.now().isoformat(timespec='seconds')))
+ c.execute('''CREATE TABLE IF NOT EXISTS entry_timing_lab_candidates(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,model TEXT NOT NULL,version TEXT NOT NULL,
+  current_position_id INTEGER NOT NULL UNIQUE,symbol TEXT NOT NULL,side TEXT NOT NULL,
+  candidate_created_at TEXT NOT NULL,expires_at TEXT NOT NULL,
+  original_current_entry_time TEXT NOT NULL,original_current_entry_price REAL NOT NULL,
+  original_current_score REAL,original_current_rsi REAL,original_5m_rsi REAL,
+  original_btc_volume_ratio REAL,original_eth_volume_ratio REAL,
+  original_bullish_pct REAL,original_bearish_pct REAL,
+  original_support_distance_pct REAL,original_resistance_distance_pct REAL,
+  trend_15m INTEGER,trend_1h INTEGER,trend_4h INTEGER,original_atr REAL NOT NULL,
+  confirmation_status TEXT NOT NULL DEFAULT 'PENDING',confirmation_at TEXT,
+  confirmation_price REAL,confirmation_delay_seconds REAL,candle_open REAL,candle_high REAL,
+  candle_low REAL,candle_close REAL,previous_5m_close REAL,rsi_5m REAL,volume_ratio_5m REAL,
+  price_move_from_original_pct REAL,price_move_from_original_r REAL,terminal_reason TEXT,
+  shadow_entry_price REAL,shadow_stop_price REAL,shadow_initial_stop REAL,shadow_qty REAL,
+  shadow_remaining_qty REAL,shadow_initial_risk_usd REAL,shadow_current_stop REAL,
+  tp1_reached INTEGER NOT NULL DEFAULT 0,tp2_reached INTEGER NOT NULL DEFAULT 0,
+  mae REAL NOT NULL DEFAULT 0,mae_r REAL NOT NULL DEFAULT 0,mfe REAL NOT NULL DEFAULT 0,
+  mfe_r REAL NOT NULL DEFAULT 0,gross_pnl REAL NOT NULL DEFAULT 0,fee REAL NOT NULL DEFAULT 0,
+  net_pnl REAL NOT NULL DEFAULT 0,exit_price REAL,exit_reason TEXT,closed_at TEXT,
+  created_at TEXT NOT NULL,updated_at TEXT NOT NULL,
+  FOREIGN KEY(current_position_id) REFERENCES positions(id)
+ )''')
+ c.execute('CREATE INDEX IF NOT EXISTS idx_entry_timing_lab_status ON entry_timing_lab_candidates(confirmation_status)')
  # Existing open positions can only be tracked accurately from this upgrade forward.
  now_iso=datetime.now().isoformat(timespec='seconds')
  c.execute("UPDATE positions SET tracking_started_at=? WHERE status='OPEN' AND tracking_started_at IS NULL",(now_iso,))
@@ -294,7 +327,7 @@ def atr(rows,n=14):
  for i in range(1,len(rows)):
   h,l,pc=rows[i][2],rows[i][3],rows[i-1][4]; tr.append(max(h-l,abs(h-pc),abs(l-pc)))
  return sum(tr[-n:])/min(n,len(tr)) if tr else 0
-TF={'15m':'Min15','1h':'Min60','4h':'Hour4'}
+TF={'5m':'Min5','15m':'Min15','1h':'Min60','4h':'Hour4'}
 # Shared MEXC request gate: scanner, live prices and API tests use one throttle.
 mexc_request_lock=asyncio.Lock()
 mexc_last_request_at=0.0
@@ -1053,6 +1086,24 @@ def _insert_entry_quality_v3_research(c,position_id,symbol,side,opened,score,sco
   regime.get('btc_15m_volume_ratio'),regime.get('eth_15m_volume_ratio'),score_data.get('trend_15m'),
   score_data.get('trend_1h'),score_data.get('trend_4h'),json.dumps(rules,separators=(',',':')),opened,opened))
 
+def _insert_entry_timing_candidate(c,position_id,symbol,side,opened,score,score_data,regime,m):
+ # Additive, LONG-only shadow cohort. The UNIQUE current_position_id is the duplicate guard.
+ if side!='LONG':return
+ m5=m.get('5m') or {}; expires=(datetime.fromisoformat(opened)+timedelta(seconds=ENTRY_TIMING_CONFIRMATION_SECONDS)).isoformat(timespec='seconds')
+ c.execute('''INSERT OR IGNORE INTO entry_timing_lab_candidates(
+  model,version,current_position_id,symbol,side,candidate_created_at,expires_at,
+  original_current_entry_time,original_current_entry_price,original_current_score,
+  original_current_rsi,original_5m_rsi,original_btc_volume_ratio,original_eth_volume_ratio,
+  original_bullish_pct,original_bearish_pct,original_support_distance_pct,
+  original_resistance_distance_pct,trend_15m,trend_1h,trend_4h,original_atr,created_at,updated_at
+ ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(
+  ENTRY_TIMING_LAB_MODEL,ENTRY_TIMING_LAB_VERSION,position_id,symbol,side,opened,expires,
+  opened,float(m['15m']['price']),float(score),score_data.get('rsi_value'),m5.get('rsi'),
+  regime.get('btc_15m_volume_ratio'),regime.get('eth_15m_volume_ratio'),regime.get('bullish_pct'),
+  regime.get('bearish_pct'),score_data.get('support_distance_pct'),score_data.get('resistance_distance_pct'),
+  score_data.get('trend_15m'),score_data.get('trend_1h'),score_data.get('trend_4h'),
+  float(m['15m']['atr']),opened,opened))
+
 def _current_entry_plan(sym,side,m):
  p=float(m['15m']['price'])
  dist=max(float(m['15m']['atr'])*float(settings['stop_atr_mult']),p*.002)
@@ -1134,6 +1185,7 @@ def paper_open(sym,side,m,sc,regime_snapshot=None):
   _insert_market_regime_snapshot(c,cur.lastrowid,regime_snapshot)
   _insert_entry_quality_v2_research(c,cur.lastrowid,sym,side,opened,sc,snapshot,regime_snapshot)
   _insert_entry_quality_v3_research(c,cur.lastrowid,sym,side,opened,sc,snapshot,regime_snapshot)
+  _insert_entry_timing_candidate(c,cur.lastrowid,sym,side,opened,sc,snapshot,regime_snapshot,m)
   return cur.lastrowid
  position_id=_sqlite_write_with_retry(write)
  try:
@@ -1188,6 +1240,105 @@ def _manage_reject_shadows_once(c):
     (result['remaining_qty'],result['stop'],result['mae'],result['mae_r'],result['mfe'],result['mfe_r'],
      int(bool(result.get('tp1_done'))),int(bool(result.get('tp2_done'))),result['gross_pnl'],result['fee_paid'],result['net_pnl'],now,row['id']))
 
+def _completed_5m_snapshot(rows,now=None):
+ """Return only exchange candles whose five-minute interval has completed."""
+ now=now or datetime.now(); cutoff=now.timestamp()
+ complete=[x for x in rows if float(x[0])+300<=cutoff]
+ if len(complete)<26:return None
+ current,previous=complete[-1],complete[-2]
+ closes=[x[4] for x in complete]; vols=[x[5] for x in complete]
+ return {'opened_at':datetime.fromtimestamp(current[0]).isoformat(timespec='seconds'),
+  'closed_at':datetime.fromtimestamp(current[0]+300).isoformat(timespec='seconds'),
+  'open':current[1],'high':current[2],'low':current[3],'close':current[4],
+  'previous_close':previous[4],'rsi':rsi(closes),
+  'volume_ratio':(sum(vols[-5:])/5)/(sum(vols[-25:-5])/20 or 1)}
+
+def _entry_timing_evaluate(candidate,candle,reference_price,now=None):
+ now=now or datetime.now(); original=float(candidate['original_current_entry_price'])
+ original_risk=abs(original-(original-float(candidate['original_atr'])*float(settings['stop_atr_mult'])))
+ original_risk=max(original_risk,original*.002)
+ move=reference_price-original; move_r=move/original_risk if original_risk else 0.0
+ common={'price_move_from_original_pct':move/(original or 1)*100,'price_move_from_original_r':move_r}
+ if move_r>=ENTRY_TIMING_CHASE_R:
+  return {'action':'CHASED_EXPIRED','reason':'CHASED_GTE_0_75R',**common}
+ if now>=datetime.fromisoformat(candidate['expires_at']):
+  return {'action':'NO_CONFIRMATION_TIMEOUT','reason':'NO_CONFIRMATION_TIMEOUT',**common}
+ if not candle or datetime.fromisoformat(candle['closed_at'])<=datetime.fromisoformat(candidate['candidate_created_at']):
+  return {'action':'PENDING',**common}
+ baseline=candidate.get('original_5m_rsi')
+ confirmed=(candle['close']>candle['open'] and candle['close']>candle['previous_close']
+  and (baseline is None or candle['rsi']>=float(baseline)) and candle['volume_ratio']>=0.8)
+ return {'action':'CONFIRMED' if confirmed else 'PENDING',**common}
+
+def _update_entry_timing_candidate(c,candidate,candle,reference_price,now=None):
+ now=now or datetime.now(); now_iso=now.isoformat(timespec='seconds')
+ result=_entry_timing_evaluate(candidate,candle,reference_price,now)
+ fields=[result['price_move_from_original_pct'],result['price_move_from_original_r'],now_iso,candidate['id']]
+ if result['action']=='PENDING':
+  c.execute('''UPDATE entry_timing_lab_candidates SET price_move_from_original_pct=?,
+   price_move_from_original_r=?,updated_at=? WHERE id=? AND confirmation_status='PENDING' ''',fields)
+  return result['action']
+ if result['action'] in ('CHASED_EXPIRED','NO_CONFIRMATION_TIMEOUT'):
+  c.execute('''UPDATE entry_timing_lab_candidates SET confirmation_status=?,terminal_reason=?,
+   price_move_from_original_pct=?,price_move_from_original_r=?,updated_at=?
+   WHERE id=? AND confirmation_status='PENDING' ''',(result['action'],result['reason'],*fields))
+  return result['action']
+ delay=max(0.0,(now-datetime.fromisoformat(candidate['candidate_created_at'])).total_seconds())
+ shadow_market={'15m':{'price':reference_price,'atr':float(candidate['original_atr'])}}
+ plan=_current_entry_plan(candidate['symbol'],'LONG',shadow_market)
+ c.execute('''UPDATE entry_timing_lab_candidates SET confirmation_status='OPEN',confirmation_at=?,
+  confirmation_price=?,confirmation_delay_seconds=?,candle_open=?,candle_high=?,candle_low=?,candle_close=?,
+  previous_5m_close=?,rsi_5m=?,volume_ratio_5m=?,price_move_from_original_pct=?,
+  price_move_from_original_r=?,shadow_entry_price=?,shadow_stop_price=?,shadow_initial_stop=?,
+  shadow_qty=?,shadow_remaining_qty=?,shadow_initial_risk_usd=?,shadow_current_stop=?,fee=?,net_pnl=?,updated_at=?
+  WHERE id=? AND confirmation_status='PENDING' ''',(now_iso,reference_price,delay,candle['open'],candle['high'],
+  candle['low'],candle['close'],candle['previous_close'],candle['rsi'],candle['volume_ratio'],
+  result['price_move_from_original_pct'],result['price_move_from_original_r'],reference_price,
+  plan['initial_stop'],plan['initial_stop'],plan['qty'],plan['qty'],plan['initial_risk_usd'],
+  plan['current_stop'],plan['entry_fee'],-plan['entry_fee'],now_iso,candidate['id']))
+ return 'CONFIRMED'
+
+def _manage_entry_timing_shadows_once(c):
+ rows=c.execute("SELECT * FROM entry_timing_lab_candidates WHERE confirmation_status='OPEN'").fetchall()
+ for raw in rows:
+  row=dict(raw); price=float((state.get('live_prices') or {}).get(row['symbol']) or 0)
+  if price<=0:continue
+  data={'entry':row['shadow_entry_price'],'initial_stop':row['shadow_initial_stop'],'stop':row['shadow_current_stop'],
+   'side':'LONG','qty':row['shadow_qty'],'remaining_qty':row['shadow_remaining_qty'],
+   'tp1_done':row['tp1_reached'],'tp2_done':row['tp2_reached'],'mae':row['mae'],'mae_r':row['mae_r'],
+   'mfe':row['mfe'],'mfe_r':row['mfe_r'],'gross_pnl':row['gross_pnl'],'fee_paid':row['fee']}
+  result=_current_position_transition(data,price); now=datetime.now().isoformat(timespec='seconds')
+  status='CLOSED' if result['closed'] else 'OPEN'
+  c.execute('''UPDATE entry_timing_lab_candidates SET confirmation_status=?,shadow_remaining_qty=?,
+   shadow_current_stop=?,tp1_reached=?,tp2_reached=?,mae=?,mae_r=?,mfe=?,mfe_r=?,gross_pnl=?,
+   fee=?,net_pnl=?,exit_price=?,exit_reason=?,closed_at=?,updated_at=? WHERE id=? AND confirmation_status='OPEN' ''',
+   (status,result['remaining_qty'],result['stop'],int(bool(result.get('tp1_done'))),int(bool(result.get('tp2_done'))),
+   result['mae'],result['mae_r'],result['mfe'],result['mfe_r'],result['gross_pnl'],result['fee_paid'],
+   result['net_pnl'],result.get('exit_price'),result.get('close_reason'),now if result['closed'] else None,now,row['id']))
+
+async def manage_entry_timing_candidates(client):
+ c=db(); pending=[dict(x) for x in c.execute("SELECT * FROM entry_timing_lab_candidates WHERE confirmation_status='PENDING'").fetchall()]; c.close()
+ if not pending:return
+ for candidate in pending:
+  try:
+   reference=float((state.get('live_prices') or {}).get(candidate['symbol']) or 0)
+   if reference>0:
+    preliminary=_entry_timing_evaluate(candidate,None,reference)
+    if preliminary['action'] in ('CHASED_EXPIRED','NO_CONFIRMATION_TIMEOUT'):
+     def expire(c):return _update_entry_timing_candidate(c,candidate,None,reference)
+     action=_sqlite_write_with_retry(expire)
+     log(f"ENTRY_TIMING_LAB #{candidate['id']} {candidate['symbol']} {action}",'RESEARCH')
+     continue
+   rows=await limited_klines(client,candidate['symbol'],'5m',40)
+   candle=_completed_5m_snapshot(rows)
+   reference=float((state.get('live_prices') or {}).get(candidate['symbol']) or (candle or {}).get('close') or 0)
+   if reference<=0:continue
+   def write(c):return _update_entry_timing_candidate(c,candidate,candle,reference)
+   action=_sqlite_write_with_retry(write)
+   if action!='PENDING':log(f"ENTRY_TIMING_LAB #{candidate['id']} {candidate['symbol']} {action}",'RESEARCH')
+  except Exception as e:
+   state['entry_timing_lab_error']=f'{type(e).__name__}: {e}'
+
 def _sync_entry_quality_v2_research_once(c):
  now=datetime.now().isoformat(timespec='seconds')
  c.execute('''UPDATE entry_quality_filter_v2_research AS v SET
@@ -1229,6 +1380,7 @@ def manage():
  _sqlite_write_with_retry(_manage_reject_shadows_once)
  _sqlite_write_with_retry(_sync_entry_quality_v2_research_once)
  _sqlite_write_with_retry(_sync_entry_quality_v3_research_once)
+ _sqlite_write_with_retry(_manage_entry_timing_shadows_once)
  for message,level in events:
   log(message,level)
 
@@ -1506,12 +1658,17 @@ async def limited_klines(client,symbol,tf,limit=120):
 
 async def analyze_symbol(client,sym):
  try:
-  rows15,rows1h,rows4h=await asyncio.gather(
+  rows5,rows15,rows1h,rows4h=await asyncio.gather(
+   limited_klines(client,sym,'5m',40),
    limited_klines(client,sym,'15m'),
    limited_klines(client,sym,'1h'),
-   limited_klines(client,sym,'4h')
+   limited_klines(client,sym,'4h'),return_exceptions=True
   )
+  for required in (rows15,rows1h,rows4h):
+   if isinstance(required,Exception):raise required
+  # A 5m feed failure must never suppress or alter an otherwise valid CURRENT signal.
   m={'15m':metrics(rows15),'1h':metrics(rows1h),'4h':metrics(rows4h)}
+  if not isinstance(rows5,Exception):m['5m']=metrics(rows5)
   L,S,details=scores(m)
   m['long_score']=L
   m['short_score']=S
@@ -1568,6 +1725,8 @@ async def scan_once(force_universe=False):
      if m:
       process_paper_signal(sym,m,fresh_market,previous_market,syms)
 
+    await manage_entry_timing_candidates(client)
+
    manage()
    manage_strategy_lab()
    state['last_scan']=datetime.now().isoformat(timespec='seconds')
@@ -1604,6 +1763,7 @@ async def position_engine():
     c=db()
     open_syms=[x['symbol'] for x in c.execute("SELECT DISTINCT symbol FROM positions WHERE status='OPEN'").fetchall()]
     open_syms += [x['symbol'] for x in c.execute("SELECT DISTINCT symbol FROM reject_shadow_trades WHERE status='OPEN'").fetchall()]
+    open_syms += [x['symbol'] for x in c.execute("SELECT DISTINCT symbol FROM entry_timing_lab_candidates WHERE confirmation_status IN ('PENDING','OPEN')").fetchall()]
     c.close()
     open_syms=list(dict.fromkeys(open_syms+strategy_lab_open_symbols()))
     if open_syms:
@@ -1612,11 +1772,15 @@ async def position_engine():
       limits=httpx.Limits(max_connections=4,max_keepalive_connections=4)
      ) as client:
       all_prices=await fetch_futures_prices(client)
-     for sym in open_syms:
-      if sym in all_prices:
-       state['live_prices'][sym]=all_prices[sym]
-       if sym in state.get('market',{}):
-        state['market'][sym]['price']=all_prices[sym]
+      for sym in open_syms:
+       if sym in all_prices:
+        state['live_prices'][sym]=all_prices[sym]
+        if sym in state.get('market',{}):
+         state['market'][sym]['price']=all_prices[sym]
+      last_check=float(state.get('entry_timing_last_check_monotonic') or 0)
+      if time.monotonic()-last_check>=15:
+       await manage_entry_timing_candidates(client)
+       state['entry_timing_last_check_monotonic']=time.monotonic()
      state['last_price_update']=datetime.now().isoformat(timespec='seconds')
      manage()
      manage_strategy_lab()
@@ -1830,6 +1994,49 @@ def _v2_research_metrics(rows):
   'hypothetical_filter_impact':-sum(pnls)}
 
 _v3_research_metrics=_v2_research_metrics
+
+def _entry_timing_trade_metrics(rows):
+ rows=[dict(x) for x in rows]; closed=[x for x in rows if x.get('status')=='CLOSED']
+ pnls=[float(x.get('net_pnl') or 0) for x in closed]; gross=[float(x.get('gross_pnl') or 0) for x in closed]
+ wins=sum(x>0 for x in pnls); losses=sum(x<0 for x in pnls); gross_profit=sum(x for x in pnls if x>0); gross_loss=abs(sum(x for x in pnls if x<0))
+ initial=sum(str(x.get('exit_reason') or '') in ('STOP','STOP_INFERRED') and not x.get('tp1_reached') for x in closed)
+ return {'closed':len(closed),'wins':wins,'losses':losses,'win_rate':_safe_rate(wins,len(closed)),
+  'initial_stop_count':initial,'initial_stop_rate':_safe_rate(initial,len(closed)),
+  'tp1_count':sum(bool(x.get('tp1_reached')) for x in closed),'tp1_rate':_safe_rate(sum(bool(x.get('tp1_reached')) for x in closed),len(closed)),
+  'tp2_count':sum(bool(x.get('tp2_reached')) for x in closed),'tp2_rate':_safe_rate(sum(bool(x.get('tp2_reached')) for x in closed),len(closed)),
+  'expectancy':sum(pnls)/len(closed) if closed else 0.0,'total_net_pnl':sum(pnls),
+  'profit_factor':gross_profit/gross_loss if gross_loss else (None if gross_profit else 0.0),
+  'avg_mae_r':sum(float(x.get('mae_r') or 0) for x in closed)/len(closed) if closed else 0.0,
+  'avg_mfe_r':sum(float(x.get('mfe_r') or 0) for x in closed)/len(closed) if closed else 0.0,
+  'fee_total':sum(float(x.get('fee') or 0) for x in closed),
+  'profit_retention':sum(pnls)/sum(gross)*100 if sum(gross)>0 else 0.0}
+
+@app.get('/api/entry-timing-lab')
+def entry_timing_lab():
+ c=db(); meta=c.execute('SELECT deployed_at FROM entry_timing_lab_meta WHERE version=?',(ENTRY_TIMING_LAB_VERSION,)).fetchone()
+ candidates=[dict(x) for x in c.execute('SELECT * FROM entry_timing_lab_candidates ORDER BY id').fetchall()]
+ matched_ids=[x['current_position_id'] for x in candidates if x['confirmation_status']=='CLOSED']
+ positions=[]
+ if matched_ids:
+  marks=','.join('?' for _ in matched_ids)
+  positions=[dict(x) for x in c.execute(f"SELECT * FROM positions WHERE status='CLOSED' AND id IN ({marks})",matched_ids).fetchall()]
+ c.close(); closed_ids={x['id'] for x in positions}
+ shadow_rows=[{**x,'status':'CLOSED'} for x in candidates if x['confirmation_status']=='CLOSED' and x['current_position_id'] in closed_ids]
+ current_rows=[{'status':'CLOSED','net_pnl':x.get('pnl'),'gross_pnl':float(x.get('pnl') or 0)+float(x.get('fee_paid') or 0),
+  'fee':x.get('fee_paid'),'tp1_reached':x.get('tp1_done'),'tp2_reached':x.get('tp2_done'),'mae_r':x.get('mae_r'),
+  'mfe_r':x.get('mfe_r'),'exit_reason':x.get('close_reason')} for x in positions]
+ current=_entry_timing_trade_metrics(current_rows); confirmed=_entry_timing_trade_metrics(shadow_rows)
+ delta={k:confirmed[k]-current[k] for k in ('total_net_pnl','expectancy','win_rate','initial_stop_rate','tp1_rate','tp2_rate','avg_mae_r','avg_mfe_r')}
+ confirmed_candidates=[x for x in candidates if x['confirmation_status'] in ('OPEN','CLOSED')]
+ return {'model':ENTRY_TIMING_LAB_MODEL,'version':ENTRY_TIMING_LAB_VERSION,
+  'deployed_at':meta['deployed_at']+'Z' if meta else None,'error':state.get('entry_timing_lab_error'),
+  'total_candidates':len(candidates),'confirmed_count':len(confirmed_candidates),
+  'confirmation_rate':_safe_rate(len(confirmed_candidates),len(candidates)),
+  'timeout_count':sum(x['confirmation_status']=='NO_CONFIRMATION_TIMEOUT' for x in candidates),
+  'chased_expired_count':sum(x['confirmation_status']=='CHASED_EXPIRED' for x in candidates),
+  'average_confirmation_delay':sum(float(x.get('confirmation_delay_seconds') or 0) for x in confirmed_candidates)/len(confirmed_candidates) if confirmed_candidates else 0.0,
+  'closed_matched_count':len(shadow_rows),'current':current,'confirmed':confirmed,'delta':delta,
+  'rows':list(reversed(candidates[-200:]))}
 
 @app.get('/api/entry-quality-filter-v2-research')
 def entry_quality_filter_v2_research():
