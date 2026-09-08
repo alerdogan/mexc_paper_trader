@@ -20,6 +20,9 @@ STRATEGY_LAB_VERSION='1.0'
 SCORE_SNAPSHOT_VERSION='1.0'
 MARKET_REGIME_SNAPSHOT_VERSION='1.0'
 ENTRY_QUALITY_FILTER_VERSION='ENTRY_QUALITY_FILTER_V1'
+ENTRY_QUALITY_FILTER_V1_ACTIVE=True
+PAPER_EPOCH_VERSION='PAPER_CURRENT_V1_ACTIVE'
+PAPER_EPOCH_STARTING_BALANCE=4000.0
 REJECT_SHADOW_VERSION='REJECT_SHADOW_V1'
 POST_ENTRY_FILTER_COHORT='POST_ENTRY_FILTER_V1'
 ENTRY_QUALITY_FILTER_V2_RESEARCH_VERSION='ENTRY_QUALITY_FILTER_V2_RESEARCH'
@@ -87,6 +90,14 @@ def init_db():
   c.execute('ALTER TABLE positions ADD COLUMN stop_analysis_source TEXT')
  if 'stop_analysis_at' not in cols:
   c.execute('ALTER TABLE positions ADD COLUMN stop_analysis_at TEXT')
+ if 'paper_epoch_id' not in cols:
+  c.execute('ALTER TABLE positions ADD COLUMN paper_epoch_id INTEGER')
+ c.execute('''CREATE TABLE IF NOT EXISTS paper_epochs(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL UNIQUE,started_at TEXT NOT NULL,
+  starting_balance REAL NOT NULL,v1_active INTEGER NOT NULL,v1_version TEXT NOT NULL,
+  config_snapshot TEXT NOT NULL,notes TEXT,active INTEGER NOT NULL DEFAULT 1
+ )''')
+ c.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_epochs_one_active ON paper_epochs(active) WHERE active=1')
  c.execute('''CREATE TABLE IF NOT EXISTS strategy_lab_experiments(
   id INTEGER PRIMARY KEY AUTOINCREMENT,source_position_id INTEGER NOT NULL UNIQUE,
   symbol TEXT NOT NULL,side TEXT NOT NULL,entry REAL NOT NULL,initial_stop REAL NOT NULL,
@@ -221,6 +232,12 @@ def init_db():
   c.execute('INSERT INTO config VALUES(1,?)',(json.dumps(settings),))
  settings['symbols']=[s.replace('USDT','_USDT') if '_' not in s else s for s in settings.get('symbols',DEFAULTS['symbols'])]
  c.execute('UPDATE config SET data=? WHERE id=1',(json.dumps(settings),))
+ c.execute('''INSERT OR IGNORE INTO paper_epochs(
+  name,started_at,starting_balance,v1_active,v1_version,config_snapshot,notes,active
+  ) VALUES(?,?,?,?,?,?,?,1)''',(PAPER_EPOCH_VERSION,datetime.now().isoformat(timespec='seconds'),
+  PAPER_EPOCH_STARTING_BALANCE,int(ENTRY_QUALITY_FILTER_V1_ACTIVE),ENTRY_QUALITY_FILTER_VERSION,
+  json.dumps(settings,sort_keys=True,separators=(',',':')),
+  'Clean PAPER baseline after ENTRY_QUALITY_FILTER_V1 activation; pre-epoch open positions remain managed but excluded from epoch accounting.'))
  c.commit()
  c.close()
  state['api_saved']=credentials_available()
@@ -428,10 +445,40 @@ def all_time_realized_pnl():
  c.close()
  return float(r['pnl'] or 0)
 
+def active_paper_epoch():
+ c=db(); row=c.execute('SELECT * FROM paper_epochs WHERE active=1 ORDER BY id DESC LIMIT 1').fetchone(); c.close()
+ if not row:raise RuntimeError('Active PAPER epoch is missing')
+ result=dict(row); result['config_snapshot']=json.loads(result['config_snapshot'])
+ result['v1_active']=bool(result['v1_active']); result['active']=bool(result['active'])
+ return result
+
+def paper_epoch_metrics(epoch=None,position_views=None):
+ epoch=epoch or active_paper_epoch(); epoch_id=int(epoch['id'])
+ c=db(); rows=[dict(x) for x in c.execute(
+  'SELECT id,status,pnl,fee_paid,closed_at FROM positions WHERE paper_epoch_id=? ORDER BY COALESCE(closed_at,opened_at),id',
+  (epoch_id,)).fetchall()]; c.close()
+ realized=sum(float(x['pnl'] or 0) for x in rows)
+ closed=[x for x in rows if x['status']=='CLOSED']; closed_pnls=[float(x['pnl'] or 0) for x in closed]
+ wins=sum(x>0 for x in closed_pnls); losses=sum(x<0 for x in closed_pnls)
+ gains=sum(x for x in closed_pnls if x>0); loss_abs=abs(sum(x for x in closed_pnls if x<0))
+ equity_curve=float(epoch['starting_balance']); peak=equity_curve; max_drawdown=0.0
+ for pnl in closed_pnls:
+  equity_curve+=pnl; peak=max(peak,equity_curve); max_drawdown=max(max_drawdown,peak-equity_curve)
+ if position_views is None:
+  c=db(); epoch_open=c.execute("SELECT * FROM positions WHERE status='OPEN' AND paper_epoch_id=?",(epoch_id,)).fetchall(); c.close()
+  position_views=[position_live_view(x) for x in epoch_open]
+ unrealized=sum(float(x['unrealized_pnl']) for x in position_views if int(x.get('paper_epoch_id') or 0)==epoch_id)
+ starting=float(epoch['starting_balance']); balance=starting+realized
+ return {**epoch,'position_count':len(rows),'closed_count':len(closed),'starting_balance':starting,
+  'current_balance':balance,'realized_pnl':realized,'unrealized_pnl':unrealized,'equity':balance+unrealized,
+  'fees':sum(float(x['fee_paid'] or 0) for x in rows),'wins':wins,'losses':losses,
+  'win_rate':wins/len(closed)*100 if closed else 0.0,
+  'expectancy':sum(closed_pnls)/len(closed) if closed else 0.0,
+  'profit_factor':gains/loss_abs if loss_abs else (None if gains else 0.0),'max_drawdown':max_drawdown}
+
 def current_paper_balance():
- # Cash wallet: starting balance + every realized P/L, including partial TP sales
- # on positions that are still open. Unrealized P/L is intentionally excluded.
- return float(settings['paper_balance'])+all_time_realized_pnl()
+ # Active epoch cash includes entry fees and partial TP realized P/L for epoch positions only.
+ return float(paper_epoch_metrics()['current_balance'])
 
 def used_open_margin():
  leverage=max(float(settings.get('leverage',1) or 1),1.0)
@@ -1080,7 +1127,9 @@ def paper_open(sym,side,m,sc,regime_snapshot=None):
  else:
   regime_snapshot={**regime_snapshot,'captured_at':opened}
  def write(c):
-  cur=c.execute('''INSERT INTO positions(symbol,side,status,entry,stop,initial_stop,qty,remaining_qty,risk_usd,score,opened_at,pnl,fee_paid,mae_r,mfe_r,tracking_started_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(sym,side,'OPEN',p,stop,stop,qty,qty,actual,sc,opened,-entry_fee,entry_fee,0.0,0.0,opened))
+  epoch=c.execute('SELECT id FROM paper_epochs WHERE active=1 ORDER BY id DESC LIMIT 1').fetchone()
+  if not epoch:raise RuntimeError('Active PAPER epoch is missing')
+  cur=c.execute('''INSERT INTO positions(symbol,side,status,entry,stop,initial_stop,qty,remaining_qty,risk_usd,score,opened_at,pnl,fee_paid,mae_r,mfe_r,tracking_started_at,paper_epoch_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(sym,side,'OPEN',p,stop,stop,qty,qty,actual,sc,opened,-entry_fee,entry_fee,0.0,0.0,opened,epoch['id']))
   _insert_score_snapshot(c,cur.lastrowid,snapshot)
   _insert_market_regime_snapshot(c,cur.lastrowid,regime_snapshot)
   _insert_entry_quality_v2_research(c,cur.lastrowid,sym,side,opened,sc,snapshot,regime_snapshot)
@@ -1676,19 +1725,18 @@ def health():
 def status():
  c=db(); raw_pos=c.execute("SELECT * FROM positions WHERE status='OPEN' ORDER BY id DESC").fetchall(); logs=[dict(x) for x in c.execute('SELECT * FROM logs ORDER BY id DESC LIMIT 80').fetchall()]; c.close()
  pos=[position_live_view(x) for x in raw_pos]
- unrealized=sum(float(x['unrealized_pnl']) for x in pos)
- realized_open=sum(float(x['realized_pnl']) for x in pos)
+ all_time_unrealized=sum(float(x['unrealized_pnl']) for x in pos)
+ all_time_realized_open=sum(float(x['realized_pnl']) for x in pos)
  stats=period_stats()
  total_closed=all_time_closed_pnl()
  total_realized=all_time_realized_pnl()
- current_balance=float(settings['paper_balance'])+total_realized
- # current_balance already includes realized partial TP/fees from OPEN positions.
- # Equity therefore adds only unrealized P/L; do not double-count realized_open.
- equity=current_balance+unrealized
+ epoch=paper_epoch_metrics(position_views=pos)
+ current_balance=epoch['current_balance']; unrealized=epoch['unrealized_pnl']; equity=epoch['equity']
  used_margin=used_open_margin()
  reserve=max(current_balance,0.0)*max(float(settings.get('min_free_balance_pct',20.0)),0.0)/100.0
  available_margin=max(0.0,current_balance-used_margin-reserve)
- return {'state':state,'settings':settings,'positions':pos,'logs':logs,'open_risk':open_risk(),'available_open_risk':max(0.0,float(settings['max_total_open_risk_usd'])-open_risk()),'period_stats':stats,'effective_threshold':int(state['paper_test_threshold'] or settings['signal_threshold']),'portfolio':{'starting_balance':float(settings['paper_balance']),'current_balance':current_balance,'all_time_closed_pnl':total_closed,'all_time_realized_pnl':total_realized,'unrealized_pnl':unrealized,'open_realized_pnl':realized_open,'today_closed_pnl':stats['daily']['pnl'],'equity':equity,'used_margin':used_margin,'reserve_balance':reserve,'available_margin':available_margin}}
+ all_time_balance=float(settings['paper_balance'])+total_realized
+ return {'state':state,'settings':settings,'positions':pos,'logs':logs,'open_risk':open_risk(),'available_open_risk':max(0.0,float(settings['max_total_open_risk_usd'])-open_risk()),'period_stats':stats,'effective_threshold':int(state['paper_test_threshold'] or settings['signal_threshold']),'entry_filter':{'version':ENTRY_QUALITY_FILTER_VERSION,'active':ENTRY_QUALITY_FILTER_V1_ACTIVE},'paper_epoch':epoch,'portfolio':{'starting_balance':epoch['starting_balance'],'current_balance':current_balance,'all_time_closed_pnl':total_closed,'all_time_realized_pnl':total_realized,'unrealized_pnl':unrealized,'open_realized_pnl':sum(float(x['realized_pnl']) for x in pos if x.get('paper_epoch_id')==epoch['id']),'today_closed_pnl':stats['daily']['pnl'],'equity':equity,'used_margin':used_margin,'reserve_balance':reserve,'available_margin':available_margin},'all_time':{'starting_balance':float(settings['paper_balance']),'current_balance':all_time_balance,'realized_pnl':total_realized,'closed_pnl':total_closed,'unrealized_pnl':all_time_unrealized,'open_realized_pnl':all_time_realized_open,'equity':all_time_balance+all_time_unrealized}}
 
 @app.get('/api/entry-filter-rejections')
 def entry_filter_rejections():
