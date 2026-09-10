@@ -124,6 +124,53 @@ def test_start_background_tasks_registers_all_supervisors(
     asyncio.run(scenario())
 
 
+def test_startup_auto_starts_paper_without_live_side_effects(isolated_app, monkeypatch):
+    module, _ = isolated_app
+    started = []
+    monkeypatch.setattr(module, "init_db", lambda: None)
+    monkeypatch.setattr(module, "start_background_tasks", lambda: started.append(True))
+    monkeypatch.setattr(module, "log", lambda *args, **kwargs: None)
+    module.state.update(running=False, panic=True, entry_paused=True, error="old")
+
+    asyncio.run(module.startup())
+
+    assert module.PAPER_AUTO_START is True
+    assert module.state["running"] is True
+    assert module.state["panic"] is False
+    assert module.state["entry_paused"] is False
+    assert module.state["error"] is None
+    assert started == [True]
+    assert module.live_fee_test_status()["status"] == "DISARMED"
+
+
+def test_start_background_tasks_is_idempotent(isolated_app, monkeypatch):
+    module, _ = isolated_app
+    calls = {name: 0 for name in module.TASK_NAMES}
+
+    def worker(name):
+        async def run():
+            calls[name] += 1
+            await asyncio.Event().wait()
+        return run
+
+    monkeypatch.setattr(module, "engine", worker("scanner"))
+    monkeypatch.setattr(module, "position_engine", worker("position_engine"))
+    monkeypatch.setattr(module, "ghost_analysis_engine", worker("ghost_analyzer"))
+
+    async def scenario():
+        module.start_background_tasks()
+        first = dict(module.background_tasks)
+        module.start_background_tasks()
+        await asyncio.sleep(0)
+        assert module.background_tasks == first
+        assert calls == {name: 1 for name in module.TASK_NAMES}
+        for task in first.values():
+            task.cancel()
+        await asyncio.gather(*first.values(), return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
 def test_supervisor_backoff_is_bounded_and_non_decreasing():
     assert app.SUPERVISOR_BACKOFF
     assert tuple(sorted(app.SUPERVISOR_BACKOFF)) == app.SUPERVISOR_BACKOFF

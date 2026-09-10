@@ -29,6 +29,7 @@ ENTRY_QUALITY_FILTER_V2_RESEARCH_VERSION='ENTRY_QUALITY_FILTER_V2_RESEARCH'
 ENTRY_QUALITY_FILTER_V3_RESEARCH_VERSION='ENTRY_QUALITY_FILTER_V3_RESEARCH'
 ENTRY_TIMING_LAB_VERSION='CONFIRMED_5M_ENTRY_V1'
 ENTRY_TIMING_LAB_MODEL='CONFIRMED_5M_ENTRY'
+PAPER_AUTO_START=True
 ENTRY_TIMING_CONFIRMATION_SECONDS=30*60
 ENTRY_TIMING_CHASE_R=0.75
 # Verified from systemd journal: filter-bearing process startup completed at this UTC instant.
@@ -1847,7 +1848,13 @@ def start_background_tasks():
 @app.on_event('startup')
 async def startup():
  init_db()
+ if PAPER_AUTO_START:
+  # Process state is intentionally PAPER-only. LIVE_FEE_TEST remains separately armed,
+  # localhost-only and one-shot; starting the scanner cannot arm or submit LIVE orders.
+  state.update(running=True,panic=False,entry_paused=False,error=None)
  start_background_tasks()
+ if PAPER_AUTO_START:
+  log('PAPER motor process başlangıcında otomatik başlatıldı')
 
 @app.get('/',response_class=HTMLResponse)
 async def home(request: Request):
