@@ -26,8 +26,8 @@ değiştirilmemiştir.
 
 ## CURRENT HEAD AFTER
 
-Aşağıdaki "GIT/GITHUB" bölümünde belirtilen commit hash'i (bu dosyanın
-commit'i ile birlikte).
+`a785e54b614bdbee085d7a01031edcfbef5076b2`
+(docs: add project CLAUDE.md constitution and takeover audit result)
 
 ## ARCHITECTURE
 
@@ -222,9 +222,10 @@ kuralları korunmuş, bunlara referans verilmiştir.
   değişiklik yok.
 - Staged/commit öncesi kontrol: `trader.db`, `.env`, `secrets`,
   `credentials`, `backups/` → **staged değil**.
-- Commit: `CLAUDE.md` ve `MEXC_GOREV_01_SONUC.md` eklendi.
-- `git push origin main` çalıştırıldı (bu dosyanın "commit" adımından
-  hemen sonra; işlem çıktısı terminal/chat özetinde belirtildi).
+- Commit: `a785e54b614bdbee085d7a01031edcfbef5076b2` — `CLAUDE.md` ve
+  `MEXC_GOREV_01_SONUC.md` eklendi (bu düzeltme öncesi hash; sonuç
+  dosyasındaki hash düzeltmesi için ayrı bir takip commit'i atıldı).
+- `git push origin main` çalıştırıldı.
 
 ## IMPORTANT RISKS
 
