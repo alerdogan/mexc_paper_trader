@@ -32,6 +32,12 @@ ENTRY_TIMING_LAB_MODEL='CONFIRMED_5M_ENTRY'
 PAPER_AUTO_START=True
 ENTRY_TIMING_CONFIRMATION_SECONDS=30*60
 ENTRY_TIMING_CHASE_R=0.75
+MOMENTUM_5M_ENTRY_VERSION='MOMENTUM_5M_ENTRY_V1'
+MOMENTUM_5M_ENTRY_MODEL='MOMENTUM_5M_ENTRY'
+MOMENTUM_5M_MAX_WAIT_SECONDS=30*60
+MOMENTUM_5M_MIN_MOVE_R=0.10
+MOMENTUM_5M_MAX_CHASE_R=0.75
+MOMENTUM_5M_MIN_VOLUME_RATIO=0.80
 # Verified from systemd journal: filter-bearing process startup completed at this UTC instant.
 ENTRY_QUALITY_FILTER_V1_DEPLOYED_AT='2026-09-04T07:45:28'
 SUPERVISOR_BACKOFF=(1,2,5,10,30)
@@ -247,6 +253,57 @@ def init_db():
   FOREIGN KEY(current_position_id) REFERENCES positions(id)
  )''')
  c.execute('CREATE INDEX IF NOT EXISTS idx_entry_timing_lab_status ON entry_timing_lab_candidates(confirmation_status)')
+ c.execute('''CREATE TABLE IF NOT EXISTS momentum_5m_entry_meta(
+  version TEXT PRIMARY KEY,deployed_at TEXT NOT NULL,params_json TEXT NOT NULL
+ )''')
+ c.execute('''INSERT OR IGNORE INTO momentum_5m_entry_meta(version,deployed_at,params_json) VALUES(?,?,?)''',
+  (MOMENTUM_5M_ENTRY_VERSION,datetime.now().isoformat(timespec='seconds'),json.dumps({
+   'model_name':MOMENTUM_5M_ENTRY_MODEL,'max_wait_minutes':MOMENTUM_5M_MAX_WAIT_SECONDS//60,
+   'min_move_R':MOMENTUM_5M_MIN_MOVE_R,'max_chase_R':MOMENTUM_5M_MAX_CHASE_R,
+   'min_volume_ratio':MOMENTUM_5M_MIN_VOLUME_RATIO,'completed_candles_only':True,
+   'rsi_non_deterioration':True,
+   'breakout_definition':'close > running max(high) of completed 5m candles since candidate creation, '
+    'anchored at the original CURRENT LONG entry price; no lookahead, first evaluable candle never '
+    'uses its own high as its own reference.'
+  },sort_keys=True,separators=(',',':'))))
+ # Additive, LONG-only, research-only forward model. Candidate creation is gated on a real CURRENT
+ # PAPER LONG position (same eligible cohort as entry_timing_lab_candidates); never blocks CURRENT.
+ c.execute('''CREATE TABLE IF NOT EXISTS momentum_5m_entry_candidates(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,model TEXT NOT NULL,version TEXT NOT NULL,
+  current_position_id INTEGER NOT NULL UNIQUE,symbol TEXT NOT NULL,side TEXT NOT NULL,
+  candidate_created_at TEXT NOT NULL,expires_at TEXT NOT NULL,
+  original_current_entry_price REAL NOT NULL,original_current_score REAL,
+  original_5m_rsi REAL,original_atr REAL NOT NULL,
+  breakout_reference_high REAL,last_evaluated_candle_ts REAL,
+  confirmation_status TEXT NOT NULL DEFAULT 'PENDING',terminal_reason TEXT,
+  confirmation_at TEXT,confirmation_price REAL,confirmation_delay_seconds REAL,
+  candle_open REAL,candle_high REAL,candle_low REAL,candle_close REAL,
+  previous_5m_close REAL,rsi_5m REAL,volume_ratio_5m REAL,breakout_reference_at_confirmation REAL,
+  price_move_from_original_pct REAL,price_move_from_original_r REAL,
+  shadow_entry_price REAL,shadow_stop_price REAL,shadow_initial_stop REAL,shadow_qty REAL,
+  shadow_remaining_qty REAL,shadow_initial_risk_usd REAL,shadow_current_stop REAL,
+  tp1_reached INTEGER NOT NULL DEFAULT 0,tp2_reached INTEGER NOT NULL DEFAULT 0,
+  mae REAL NOT NULL DEFAULT 0,mae_r REAL NOT NULL DEFAULT 0,mfe REAL NOT NULL DEFAULT 0,
+  mfe_r REAL NOT NULL DEFAULT 0,gross_pnl REAL NOT NULL DEFAULT 0,fee REAL NOT NULL DEFAULT 0,
+  net_pnl REAL NOT NULL DEFAULT 0,exit_price REAL,exit_reason TEXT,closed_at TEXT,
+  created_at TEXT NOT NULL,updated_at TEXT NOT NULL,
+  FOREIGN KEY(current_position_id) REFERENCES positions(id)
+ )''')
+ c.execute('CREATE INDEX IF NOT EXISTS idx_momentum_5m_status ON momentum_5m_entry_candidates(confirmation_status)')
+ # Bounded per-candle audit trail: at most ~max_wait_minutes/5 rows per candidate.
+ c.execute('''CREATE TABLE IF NOT EXISTS momentum_5m_entry_candle_evaluations(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,candidate_id INTEGER NOT NULL,
+  candle_open_ts REAL NOT NULL,candle_closed_at TEXT NOT NULL,
+  open REAL,high REAL,low REAL,close REAL,previous_close REAL,
+  breakout_reference REAL,rsi REAL,volume_ratio REAL,move_r REAL,
+  bullish_pass INTEGER NOT NULL,previous_close_pass INTEGER NOT NULL,
+  breakout_pass INTEGER NOT NULL,rsi_pass INTEGER NOT NULL,volume_pass INTEGER NOT NULL,
+  min_move_pass INTEGER NOT NULL,chase_pass INTEGER NOT NULL,confirmed_this_candle INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(candidate_id,candle_open_ts),
+  FOREIGN KEY(candidate_id) REFERENCES momentum_5m_entry_candidates(id)
+ )''')
+ c.execute('CREATE INDEX IF NOT EXISTS idx_momentum_5m_eval_candidate ON momentum_5m_entry_candle_evaluations(candidate_id)')
  # Existing open positions can only be tracked accurately from this upgrade forward.
  now_iso=datetime.now().isoformat(timespec='seconds')
  c.execute("UPDATE positions SET tracking_started_at=? WHERE status='OPEN' AND tracking_started_at IS NULL",(now_iso,))
@@ -1105,6 +1162,19 @@ def _insert_entry_timing_candidate(c,position_id,symbol,side,opened,score,score_
   score_data.get('trend_15m'),score_data.get('trend_1h'),score_data.get('trend_4h'),
   float(m['15m']['atr']),opened,opened))
 
+def _insert_momentum_5m_candidate(c,position_id,symbol,side,opened,score,m):
+ # Additive, LONG-only shadow cohort. The UNIQUE current_position_id is the duplicate guard.
+ if side!='LONG':return
+ m5=m.get('5m') or {}
+ expires=(datetime.fromisoformat(opened)+timedelta(seconds=MOMENTUM_5M_MAX_WAIT_SECONDS)).isoformat(timespec='seconds')
+ c.execute('''INSERT OR IGNORE INTO momentum_5m_entry_candidates(
+  model,version,current_position_id,symbol,side,candidate_created_at,expires_at,
+  original_current_entry_price,original_current_score,original_5m_rsi,original_atr,
+  created_at,updated_at
+ ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',(
+  MOMENTUM_5M_ENTRY_MODEL,MOMENTUM_5M_ENTRY_VERSION,position_id,symbol,side,opened,expires,
+  float(m['15m']['price']),float(score),m5.get('rsi'),float(m['15m']['atr']),opened,opened))
+
 def _current_entry_plan(sym,side,m):
  p=float(m['15m']['price'])
  dist=max(float(m['15m']['atr'])*float(settings['stop_atr_mult']),p*.002)
@@ -1187,6 +1257,7 @@ def paper_open(sym,side,m,sc,regime_snapshot=None):
   _insert_entry_quality_v2_research(c,cur.lastrowid,sym,side,opened,sc,snapshot,regime_snapshot)
   _insert_entry_quality_v3_research(c,cur.lastrowid,sym,side,opened,sc,snapshot,regime_snapshot)
   _insert_entry_timing_candidate(c,cur.lastrowid,sym,side,opened,sc,snapshot,regime_snapshot,m)
+  _insert_momentum_5m_candidate(c,cur.lastrowid,sym,side,opened,sc,m)
   return cur.lastrowid
  position_id=_sqlite_write_with_retry(write)
  try:
@@ -1317,6 +1388,132 @@ def _manage_entry_timing_shadows_once(c):
    result['mae'],result['mae_r'],result['mfe'],result['mfe_r'],result['gross_pnl'],result['fee_paid'],
    result['net_pnl'],result.get('exit_price'),result.get('close_reason'),now if result['closed'] else None,now,row['id']))
 
+def _momentum_5m_original_risk(candidate):
+ original=float(candidate['original_current_entry_price'] or 0); atr=float(candidate['original_atr'] or 0)
+ if original<=0:return original,0.0
+ risk=max(abs(atr*float(settings['stop_atr_mult'])),original*.002)
+ return original,risk
+
+def _momentum_5m_preliminary(candidate,reference_price,now=None):
+ now=now or datetime.now(); original,risk=_momentum_5m_original_risk(candidate)
+ if original<=0 or risk<=0:
+  return {'action':'CANCELLED_INVALID','reason':'INVALID_RISK_DATA','pct':0.0,'move_r':0.0}
+ move=reference_price-original; move_r=move/risk; pct=move/original*100
+ if move_r>=MOMENTUM_5M_MAX_CHASE_R:
+  return {'action':'MOMENTUM_CHASED_EXPIRED','reason':'CHASED_GTE_0_75R','pct':pct,'move_r':move_r}
+ if now>=datetime.fromisoformat(candidate['expires_at']):
+  return {'action':'NO_MOMENTUM_TIMEOUT','reason':'NO_MOMENTUM_TIMEOUT','pct':pct,'move_r':move_r}
+ return {'action':'PENDING','pct':pct,'move_r':move_r}
+
+def _momentum_5m_completed_candles(rows,since_iso,now=None):
+ """Ordered completed 5m candles strictly after candidate creation. Each candle's RSI/volume_ratio
+ use only closes/volumes known up to and including that candle - no lookahead into future candles."""
+ now=now or datetime.now(); cutoff=now.timestamp(); since_ts=datetime.fromisoformat(since_iso).timestamp()
+ complete=[x for x in rows if float(x[0])+300<=cutoff]
+ if len(complete)<26:return []
+ closes=[x[4] for x in complete]; vols=[x[5] for x in complete]
+ out=[]
+ for i in range(25,len(complete)):
+  ts=float(complete[i][0])
+  if ts<=since_ts:continue
+  window_closes=closes[:i+1]; window_vols=vols[:i+1]
+  out.append({'opened_at':ts,'closed_at':ts+300,
+   'open':complete[i][1],'high':complete[i][2],'low':complete[i][3],'close':complete[i][4],
+   'previous_close':complete[i-1][4],'rsi':rsi(window_closes),
+   'volume_ratio':(sum(window_vols[-5:])/5)/(sum(window_vols[-25:-5])/20 or 1)})
+ return out
+
+def _update_momentum_5m_candidate(c,candidate,candles,now=None):
+ """Process newly-completed candles for one PENDING candidate. Idempotent: candles already recorded
+ (candle_open_ts <= last_evaluated_candle_ts) are skipped without side effects. Atomic: all writes
+ happen in the caller's single transaction, and every terminal UPDATE is guarded by
+ confirmation_status='PENDING' so a candidate can only ever leave PENDING once."""
+ now=now or datetime.now(); now_iso=now.isoformat(timespec='seconds')
+ original,risk=_momentum_5m_original_risk(candidate)
+ if original<=0 or risk<=0:
+  c.execute('''UPDATE momentum_5m_entry_candidates SET confirmation_status='CANCELLED_INVALID',
+   terminal_reason='INVALID_RISK_DATA',updated_at=? WHERE id=? AND confirmation_status='PENDING' ''',
+   (now_iso,candidate['id']))
+  return 'CANCELLED_INVALID'
+ last_ts=candidate.get('last_evaluated_candle_ts')
+ running_high=float(candidate['breakout_reference_high']) if candidate.get('breakout_reference_high') is not None else original
+ baseline_rsi=candidate.get('original_5m_rsi')
+ for candle in candles:
+  if last_ts is not None and candle['opened_at']<=last_ts:
+   running_high=max(running_high,candle['high']); continue
+  move=candle['close']-original; move_r=move/risk
+  bullish_pass=candle['close']>candle['open']
+  prev_pass=candle['close']>candle['previous_close']
+  breakout_pass=candle['close']>running_high
+  rsi_pass=(baseline_rsi is None) or (candle['rsi']>=float(baseline_rsi))
+  volume_pass=candle['volume_ratio']>=MOMENTUM_5M_MIN_VOLUME_RATIO
+  min_move_pass=move_r>=MOMENTUM_5M_MIN_MOVE_R
+  chase_pass=move_r<MOMENTUM_5M_MAX_CHASE_R
+  confirmed_this=all((bullish_pass,prev_pass,breakout_pass,rsi_pass,volume_pass,min_move_pass,chase_pass))
+  c.execute('''INSERT OR IGNORE INTO momentum_5m_entry_candle_evaluations(
+   candidate_id,candle_open_ts,candle_closed_at,open,high,low,close,previous_close,
+   breakout_reference,rsi,volume_ratio,move_r,bullish_pass,previous_close_pass,breakout_pass,
+   rsi_pass,volume_pass,min_move_pass,chase_pass,confirmed_this_candle,created_at
+  ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(
+   candidate['id'],candle['opened_at'],datetime.fromtimestamp(candle['closed_at']).isoformat(timespec='seconds'),
+   candle['open'],candle['high'],candle['low'],candle['close'],candle['previous_close'],
+   running_high,candle['rsi'],candle['volume_ratio'],move_r,int(bullish_pass),int(prev_pass),
+   int(breakout_pass),int(rsi_pass),int(volume_pass),int(min_move_pass),int(chase_pass),
+   int(confirmed_this),now_iso))
+  last_ts=candle['opened_at']
+  if confirmed_this:
+   delay=max(0.0,(now-datetime.fromisoformat(candidate['candidate_created_at'])).total_seconds())
+   shadow_market={'15m':{'price':candle['close'],'atr':float(candidate['original_atr'])}}
+   plan=_current_entry_plan(candidate['symbol'],'LONG',shadow_market)
+   c.execute('''UPDATE momentum_5m_entry_candidates SET confirmation_status='CONFIRMED',
+    terminal_reason='ALL_CONDITIONS_MET',confirmation_at=?,confirmation_price=?,confirmation_delay_seconds=?,
+    candle_open=?,candle_high=?,candle_low=?,candle_close=?,previous_5m_close=?,rsi_5m=?,volume_ratio_5m=?,
+    breakout_reference_at_confirmation=?,price_move_from_original_pct=?,price_move_from_original_r=?,
+    breakout_reference_high=?,last_evaluated_candle_ts=?,
+    shadow_entry_price=?,shadow_stop_price=?,shadow_initial_stop=?,shadow_qty=?,shadow_remaining_qty=?,
+    shadow_initial_risk_usd=?,shadow_current_stop=?,fee=?,net_pnl=?,updated_at=?
+    WHERE id=? AND confirmation_status='PENDING' ''',(
+    now_iso,candle['close'],delay,candle['open'],candle['high'],candle['low'],candle['close'],
+    candle['previous_close'],candle['rsi'],candle['volume_ratio'],running_high,
+    move/(original or 1)*100,move_r,running_high,last_ts,
+    candle['close'],plan['initial_stop'],plan['initial_stop'],plan['qty'],plan['qty'],
+    plan['initial_risk_usd'],plan['current_stop'],plan['entry_fee'],-plan['entry_fee'],now_iso,candidate['id']))
+   return 'CONFIRMED'
+  if move_r>=MOMENTUM_5M_MAX_CHASE_R:
+   c.execute('''UPDATE momentum_5m_entry_candidates SET confirmation_status='MOMENTUM_CHASED_EXPIRED',
+    terminal_reason='CHASED_GTE_0_75R',price_move_from_original_pct=?,price_move_from_original_r=?,
+    breakout_reference_high=?,last_evaluated_candle_ts=?,updated_at=?
+    WHERE id=? AND confirmation_status='PENDING' ''',
+    (move/(original or 1)*100,move_r,running_high,last_ts,now_iso,candidate['id']))
+   return 'MOMENTUM_CHASED_EXPIRED'
+  running_high=max(running_high,candle['high'])
+ if now>=datetime.fromisoformat(candidate['expires_at']):
+  c.execute('''UPDATE momentum_5m_entry_candidates SET confirmation_status='NO_MOMENTUM_TIMEOUT',
+   terminal_reason='NO_MOMENTUM_TIMEOUT',breakout_reference_high=?,last_evaluated_candle_ts=?,updated_at=?
+   WHERE id=? AND confirmation_status='PENDING' ''',(running_high,last_ts,now_iso,candidate['id']))
+  return 'NO_MOMENTUM_TIMEOUT'
+ c.execute('''UPDATE momentum_5m_entry_candidates SET breakout_reference_high=?,last_evaluated_candle_ts=?,updated_at=?
+  WHERE id=? AND confirmation_status='PENDING' ''',(running_high,last_ts,now_iso,candidate['id']))
+ return 'PENDING'
+
+def _manage_momentum_5m_shadows_once(c):
+ rows=c.execute("SELECT * FROM momentum_5m_entry_candidates WHERE confirmation_status='CONFIRMED'").fetchall()
+ for raw in rows:
+  row=dict(raw); price=float((state.get('live_prices') or {}).get(row['symbol']) or 0)
+  if price<=0:continue
+  data={'entry':row['shadow_entry_price'],'initial_stop':row['shadow_initial_stop'],'stop':row['shadow_current_stop'],
+   'side':'LONG','qty':row['shadow_qty'],'remaining_qty':row['shadow_remaining_qty'],
+   'tp1_done':row['tp1_reached'],'tp2_done':row['tp2_reached'],'mae':row['mae'],'mae_r':row['mae_r'],
+   'mfe':row['mfe'],'mfe_r':row['mfe_r'],'gross_pnl':row['gross_pnl'],'fee_paid':row['fee']}
+  result=_current_position_transition(data,price); now=datetime.now().isoformat(timespec='seconds')
+  status='CLOSED' if result['closed'] else 'CONFIRMED'
+  c.execute('''UPDATE momentum_5m_entry_candidates SET confirmation_status=?,shadow_remaining_qty=?,
+   shadow_current_stop=?,tp1_reached=?,tp2_reached=?,mae=?,mae_r=?,mfe=?,mfe_r=?,gross_pnl=?,
+   fee=?,net_pnl=?,exit_price=?,exit_reason=?,closed_at=?,updated_at=? WHERE id=? AND confirmation_status='CONFIRMED' ''',
+   (status,result['remaining_qty'],result['stop'],int(bool(result.get('tp1_done'))),int(bool(result.get('tp2_done'))),
+   result['mae'],result['mae_r'],result['mfe'],result['mfe_r'],result['gross_pnl'],result['fee_paid'],
+   result['net_pnl'],result.get('exit_price'),result.get('close_reason'),now if result['closed'] else None,now,row['id']))
+
 async def manage_entry_timing_candidates(client):
  c=db(); pending=[dict(x) for x in c.execute("SELECT * FROM entry_timing_lab_candidates WHERE confirmation_status='PENDING'").fetchall()]; c.close()
  if not pending:return
@@ -1339,6 +1536,33 @@ async def manage_entry_timing_candidates(client):
    if action!='PENDING':log(f"ENTRY_TIMING_LAB #{candidate['id']} {candidate['symbol']} {action}",'RESEARCH')
   except Exception as e:
    state['entry_timing_lab_error']=f'{type(e).__name__}: {e}'
+
+async def manage_momentum_5m_candidates(client):
+ c=db(); pending=[dict(x) for x in c.execute("SELECT * FROM momentum_5m_entry_candidates WHERE confirmation_status='PENDING'").fetchall()]; c.close()
+ if not pending:return
+ for candidate in pending:
+  try:
+   reference=float((state.get('live_prices') or {}).get(candidate['symbol']) or 0)
+   if reference>0:
+    preliminary=_momentum_5m_preliminary(candidate,reference)
+    if preliminary['action']!='PENDING':
+     def expire(c):
+      c.execute('''UPDATE momentum_5m_entry_candidates SET confirmation_status=?,terminal_reason=?,
+       price_move_from_original_pct=?,price_move_from_original_r=?,updated_at=?
+       WHERE id=? AND confirmation_status='PENDING' ''',
+       (preliminary['action'],preliminary['reason'],preliminary['pct'],preliminary['move_r'],
+        datetime.now().isoformat(timespec='seconds'),candidate['id']))
+      return preliminary['action']
+     action=_sqlite_write_with_retry(expire)
+     log(f"MOMENTUM_5M_ENTRY #{candidate['id']} {candidate['symbol']} {action}",'RESEARCH')
+     continue
+   rows=await limited_klines(client,candidate['symbol'],'5m',40)
+   candles=_momentum_5m_completed_candles(rows,candidate['candidate_created_at'])
+   def write(c):return _update_momentum_5m_candidate(c,candidate,candles)
+   action=_sqlite_write_with_retry(write)
+   if action!='PENDING':log(f"MOMENTUM_5M_ENTRY #{candidate['id']} {candidate['symbol']} {action}",'RESEARCH')
+  except Exception as e:
+   state['momentum_5m_entry_error']=f'{type(e).__name__}: {e}'
 
 def _sync_entry_quality_v2_research_once(c):
  now=datetime.now().isoformat(timespec='seconds')
@@ -1382,6 +1606,7 @@ def manage():
  _sqlite_write_with_retry(_sync_entry_quality_v2_research_once)
  _sqlite_write_with_retry(_sync_entry_quality_v3_research_once)
  _sqlite_write_with_retry(_manage_entry_timing_shadows_once)
+ _sqlite_write_with_retry(_manage_momentum_5m_shadows_once)
  for message,level in events:
   log(message,level)
 
@@ -1727,6 +1952,7 @@ async def scan_once(force_universe=False):
       process_paper_signal(sym,m,fresh_market,previous_market,syms)
 
     await manage_entry_timing_candidates(client)
+    await manage_momentum_5m_candidates(client)
 
    manage()
    manage_strategy_lab()
@@ -1765,6 +1991,7 @@ async def position_engine():
     open_syms=[x['symbol'] for x in c.execute("SELECT DISTINCT symbol FROM positions WHERE status='OPEN'").fetchall()]
     open_syms += [x['symbol'] for x in c.execute("SELECT DISTINCT symbol FROM reject_shadow_trades WHERE status='OPEN'").fetchall()]
     open_syms += [x['symbol'] for x in c.execute("SELECT DISTINCT symbol FROM entry_timing_lab_candidates WHERE confirmation_status IN ('PENDING','OPEN')").fetchall()]
+    open_syms += [x['symbol'] for x in c.execute("SELECT DISTINCT symbol FROM momentum_5m_entry_candidates WHERE confirmation_status IN ('PENDING','CONFIRMED')").fetchall()]
     c.close()
     open_syms=list(dict.fromkeys(open_syms+strategy_lab_open_symbols()))
     if open_syms:
@@ -1782,6 +2009,10 @@ async def position_engine():
       if time.monotonic()-last_check>=15:
        await manage_entry_timing_candidates(client)
        state['entry_timing_last_check_monotonic']=time.monotonic()
+      last_check_momentum=float(state.get('momentum_5m_last_check_monotonic') or 0)
+      if time.monotonic()-last_check_momentum>=15:
+       await manage_momentum_5m_candidates(client)
+       state['momentum_5m_last_check_monotonic']=time.monotonic()
      state['last_price_update']=datetime.now().isoformat(timespec='seconds')
      manage()
      manage_strategy_lab()
@@ -2044,6 +2275,68 @@ def entry_timing_lab():
   'average_confirmation_delay':sum(float(x.get('confirmation_delay_seconds') or 0) for x in confirmed_candidates)/len(confirmed_candidates) if confirmed_candidates else 0.0,
   'closed_matched_count':len(shadow_rows),'current':current,'confirmed':confirmed,'delta':delta,
   'rows':list(reversed(candidates[-200:]))}
+
+@app.get('/api/momentum-5m-entry')
+def momentum_5m_entry():
+ c=db()
+ meta=c.execute('SELECT deployed_at,params_json FROM momentum_5m_entry_meta WHERE version=?',(MOMENTUM_5M_ENTRY_VERSION,)).fetchone()
+ candidates=[dict(x) for x in c.execute('SELECT * FROM momentum_5m_entry_candidates ORDER BY id').fetchall()]
+ candle_evals=[dict(x) for x in c.execute('SELECT * FROM momentum_5m_entry_candle_evaluations ORDER BY id DESC LIMIT 500').fetchall()]
+ matched_ids=[x['current_position_id'] for x in candidates if x['confirmation_status']=='CLOSED']
+ positions=[]
+ if matched_ids:
+  marks=','.join('?' for _ in matched_ids)
+  positions=[dict(x) for x in c.execute(f"SELECT * FROM positions WHERE status='CLOSED' AND id IN ({marks})",matched_ids).fetchall()]
+ c.close(); closed_ids={x['id'] for x in positions}
+ shadow_rows=[{**x,'status':'CLOSED'} for x in candidates if x['confirmation_status']=='CLOSED' and x['current_position_id'] in closed_ids]
+ current_rows=[{'status':'CLOSED','net_pnl':x.get('pnl'),'gross_pnl':float(x.get('pnl') or 0)+float(x.get('fee_paid') or 0),
+  'fee':x.get('fee_paid'),'tp1_reached':x.get('tp1_done'),'tp2_reached':x.get('tp2_done'),'mae_r':x.get('mae_r'),
+  'mfe_r':x.get('mfe_r'),'exit_reason':x.get('close_reason')} for x in positions]
+ # Independent, self-scoped matched cohort: this "current" baseline is restricted to the CURRENT
+ # positions that have a CLOSED MOMENTUM_5M_ENTRY_V1 shadow. It is NOT the same sample as
+ # CONFIRMED_5M_ENTRY_V1's own matched cohort (/api/entry-timing-lab) - the two must never be
+ # blended into one row, since a candidate can confirm under one model and not the other.
+ current=_entry_timing_trade_metrics(current_rows); momentum=_entry_timing_trade_metrics(shadow_rows)
+ delta={k:momentum[k]-current[k] for k in ('total_net_pnl','expectancy','win_rate','initial_stop_rate','tp1_rate','tp2_rate','avg_mae_r','avg_mfe_r')}
+ confirmed_candidates=[x for x in candidates if x['confirmation_status'] in ('CONFIRMED','CLOSED')]
+ # Candidate-level failure analytics from the bounded per-candle audit log (OR across a candidate's
+ # candles), so one candidate's many candles cannot inflate a "never happens" reading.
+ by_candidate={}
+ for row in candle_evals:
+  agg=by_candidate.setdefault(row['candidate_id'],dict(bullish=False,previous_close=False,breakout=False,
+   rsi=False,volume=False,min_move=False,chase=False,all=False))
+  agg['bullish']=agg['bullish'] or bool(row['bullish_pass'])
+  agg['previous_close']=agg['previous_close'] or bool(row['previous_close_pass'])
+  agg['breakout']=agg['breakout'] or bool(row['breakout_pass'])
+  agg['rsi']=agg['rsi'] or bool(row['rsi_pass'])
+  agg['volume']=agg['volume'] or bool(row['volume_pass'])
+  agg['min_move']=agg['min_move'] or bool(row['min_move_pass'])
+  agg['chase']=agg['chase'] or bool(row['chase_pass'])
+  agg['all']=agg['all'] or bool(row['confirmed_this_candle'])
+ def failure_rate(key):
+  if not candidates:return 0.0
+  return _safe_rate(sum(1 for x in candidates if by_candidate.get(x['id'],{}).get(key)),len(candidates))
+ failure_analytics={
+  'bullish_ever_seen_rate':failure_rate('bullish'),'previous_close_ever_seen_rate':failure_rate('previous_close'),
+  'breakout_ever_seen_rate':failure_rate('breakout'),'rsi_ever_seen_rate':failure_rate('rsi'),
+  'volume_ever_seen_rate':failure_rate('volume'),'min_move_ever_seen_rate':failure_rate('min_move'),
+  'chase_ever_seen_rate':failure_rate('chase'),'all_conditions_together_rate':failure_rate('all')}
+ params=json.loads(meta['params_json']) if meta else None
+ return {'model':MOMENTUM_5M_ENTRY_MODEL,'version':MOMENTUM_5M_ENTRY_VERSION,
+  'deployed_at':meta['deployed_at']+'Z' if meta else None,'params':params,
+  'error':state.get('momentum_5m_entry_error'),
+  'total_candidates':len(candidates),'pending_count':sum(x['confirmation_status']=='PENDING' for x in candidates),
+  'confirmed_count':len(confirmed_candidates),
+  'confirmation_rate':_safe_rate(len(confirmed_candidates),len(candidates)),
+  'timeout_count':sum(x['confirmation_status']=='NO_MOMENTUM_TIMEOUT' for x in candidates),
+  'chased_expired_count':sum(x['confirmation_status']=='MOMENTUM_CHASED_EXPIRED' for x in candidates),
+  'invalid_count':sum(x['confirmation_status']=='CANCELLED_INVALID' for x in candidates),
+  'average_confirmation_delay':sum(float(x.get('confirmation_delay_seconds') or 0) for x in confirmed_candidates)/len(confirmed_candidates) if confirmed_candidates else 0.0,
+  'average_confirmation_move_r':sum(float(x.get('price_move_from_original_r') or 0) for x in confirmed_candidates)/len(confirmed_candidates) if confirmed_candidates else 0.0,
+  'closed_matched_count':len(shadow_rows),'current_matched':current,'momentum':momentum,'delta':delta,
+  'failure_analytics':failure_analytics,
+  'rows':list(reversed(candidates[-200:])),
+  'candle_evaluations':list(reversed(candle_evals))[:200]}
 
 @app.get('/api/entry-quality-filter-v2-research')
 def entry_quality_filter_v2_research():
