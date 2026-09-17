@@ -20,8 +20,8 @@ deploy sonrası ileriye dönük veri toplanacak.
 
 ## HEAD AFTER
 
-Bu görevin commit'i — bkz. "GIT/GITHUB" bölümü (dosya push'tan hemen önce
-güncellenecek şekilde son commit hash'i orada raporlanır).
+`67310a36100356fe85b8513df9fb65d25c365479`
+(feat: add MOMENTUM_5M_ENTRY_V1 forward research timing model)
 
 ## PROJECT IDENTITY DOĞRULAMASI
 
@@ -294,9 +294,9 @@ INSERT (ad-hoc)/VACUUM/RESET/REPAIR/BACKFILL` çalıştırılmadı.
   `tests/test_momentum_5m_entry.py`, `MEXC_GOREV_02_SONUC.md`.
 - `trader.db`, `backups/`, `.env`, `secrets`, `credentials` → staged
   değil (commit öncesi `git status` ile doğrulandı).
-- Commit + `git push origin main` bu raporun hemen ardından yapıldı;
-  kesin commit hash'i ve push sonucu, görevin chat özetinde ve bu
-  bölümün push-sonrası halinde raporlanır.
+- Commit: `67310a36100356fe85b8513df9fb65d25c365479`.
+- `git push origin main` bu commit'in hemen ardından çalıştırıldı (bkz.
+  takip commit'i bu hash düzeltmesi için).
 
 ## WARNINGS / LIMITATIONS
 
