@@ -64,6 +64,7 @@ def isolated_app(tmp_path, monkeypatch):
     app.background_tasks.clear()
     for name in app.TASK_NAMES:
         app.task_status[name] = app._new_task_status()
+    app._RESEARCH_ERROR_LOG_DEDUP.clear()
     app.init_db()
     yield app, test_db
 

@@ -75,14 +75,32 @@ def test_bullish_confirmation_delay_entry_price_and_risk_reuse(isolated_app):
 
 
 def test_confirmation_rules_timeout_and_chased_rejection(isolated_app):
+    # MEXC_GOREV_04 ordering fix: a completed candle within the window is evaluated for confirmation
+    # FIRST (using the candle's own close for both the OHLC/RSI/volume conditions and the chase gate);
+    # the live-reference-price chase/timeout check only runs as a fallback once the candle itself does
+    # not confirm. This preserves the same +0.75R chase threshold and same confirmation conditions,
+    # it only fixes WHEN they are checked relative to an already-completed candle.
     module, _ = isolated_app
     _, row = create_candidate(module)
     created = datetime.fromisoformat(row["candidate_created_at"])
     valid = candle(closed_at=(created + timedelta(minutes=5)).isoformat(timespec="seconds"))
     assert module._entry_timing_evaluate(row, valid, 101, created + timedelta(minutes=6))["action"] == "CONFIRMED"
     assert module._entry_timing_evaluate(row, candle(close=99), 101, created + timedelta(minutes=6))["action"] == "PENDING"
-    assert module._entry_timing_evaluate(row, valid, 108, created + timedelta(minutes=6))["action"] == "CHASED_EXPIRED"
-    assert module._entry_timing_evaluate(row, valid, 101, created + timedelta(minutes=31))["action"] == "NO_CONFIRMATION_TIMEOUT"
+    # A completed candle that does NOT itself confirm (bearish close here) must not block the live
+    # chase fallback: with no favorable candle, a live price already at +0.75R still terminal-chases.
+    non_confirming = candle(closed_at=(created + timedelta(minutes=5)).isoformat(timespec="seconds"), close=99)
+    assert module._entry_timing_evaluate(row, non_confirming, 108, created + timedelta(minutes=6))["action"] == "CHASED_EXPIRED"
+    # No candle available yet (e.g. feed/API error, or genuinely nothing completed) and now is past
+    # expiry: falls through to timeout, exactly as before.
+    assert module._entry_timing_evaluate(row, None, 101, created + timedelta(minutes=31))["action"] == "NO_CONFIRMATION_TIMEOUT"
+    # A candle whose OWN move already reached chase territory cannot confirm on that candle, even
+    # though its OHLC/RSI/volume conditions look bullish - the candle-level chase gate rejects it, and
+    # it correctly falls through to the (also chased) live-price check.
+    chased_candle = candle(closed_at=(created + timedelta(minutes=5)).isoformat(timespec="seconds"), close=108, high=108.5)
+    assert module._entry_timing_evaluate(row, chased_candle, 108, created + timedelta(minutes=6))["action"] == "CHASED_EXPIRED"
+    # A completed candle that closes AFTER the candidate's expiry must never be used to confirm.
+    late = candle(closed_at=(created + timedelta(minutes=35)).isoformat(timespec="seconds"))
+    assert module._entry_timing_evaluate(row, late, 101, created + timedelta(minutes=36))["action"] == "NO_CONFIRMATION_TIMEOUT"
 
 
 def test_shadow_tp_fee_stop_and_no_paper_or_live_impact(isolated_app, monkeypatch):

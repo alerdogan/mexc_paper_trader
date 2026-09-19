@@ -27,12 +27,16 @@ REJECT_SHADOW_VERSION='REJECT_SHADOW_V1'
 POST_ENTRY_FILTER_COHORT='POST_ENTRY_FILTER_V1'
 ENTRY_QUALITY_FILTER_V2_RESEARCH_VERSION='ENTRY_QUALITY_FILTER_V2_RESEARCH'
 ENTRY_QUALITY_FILTER_V3_RESEARCH_VERSION='ENTRY_QUALITY_FILTER_V3_RESEARCH'
-ENTRY_TIMING_LAB_VERSION='CONFIRMED_5M_ENTRY_V1'
+# MEXC_GOREV_04 fix boundary: '_FIX1' versions are additive - old 'CONFIRMED_5M_ENTRY_V1' /
+# 'MOMENTUM_5M_ENTRY_V1' candidate rows are never rewritten, they simply stop being the version new
+# candidates are tagged with. The `version` column on each *_candidates table (already present pre-fix)
+# is what separates the pre-fix and post-fix research cohorts - see momentum_5m_entry()/entry_timing_lab().
+ENTRY_TIMING_LAB_VERSION='CONFIRMED_5M_ENTRY_V1_FIX1'
 ENTRY_TIMING_LAB_MODEL='CONFIRMED_5M_ENTRY'
 PAPER_AUTO_START=True
 ENTRY_TIMING_CONFIRMATION_SECONDS=30*60
 ENTRY_TIMING_CHASE_R=0.75
-MOMENTUM_5M_ENTRY_VERSION='MOMENTUM_5M_ENTRY_V1'
+MOMENTUM_5M_ENTRY_VERSION='MOMENTUM_5M_ENTRY_V1_FIX1'
 MOMENTUM_5M_ENTRY_MODEL='MOMENTUM_5M_ENTRY'
 MOMENTUM_5M_MAX_WAIT_SECONDS=30*60
 MOMENTUM_5M_MIN_MOVE_R=0.10
@@ -264,7 +268,12 @@ def init_db():
    'rsi_non_deterioration':True,
    'breakout_definition':'close > running max(high) of completed 5m candles since candidate creation, '
     'anchored at the original CURRENT LONG entry price; no lookahead, first evaluable candle never '
-    'uses its own high as its own reference.'
+    'uses its own high as its own reference.',
+   'fix1_notes':'MEXC_GOREV_04: fixed a missing 5m entry in the kline lookback-seconds map that made '
+    'every 5m candle fetch raise KeyError before any network call (root cause of zero candle audits '
+    'under MOMENTUM_5M_ENTRY_V1), and reordered candidate processing to evaluate completed candles '
+    'before the live-price chase/timeout fallback. Confirmation rules and thresholds unchanged; pre-fix '
+    'MOMENTUM_5M_ENTRY_V1 rows are preserved as-is under their original version string.'
   },sort_keys=True,separators=(',',':'))))
  # Additive, LONG-only, research-only forward model. Candidate creation is gated on a real CURRENT
  # PAPER LONG position (same eligible cohort as entry_timing_lab_candidates); never blocks CURRENT.
@@ -386,6 +395,11 @@ def atr(rows,n=14):
   h,l,pc=rows[i][2],rows[i][3],rows[i-1][4]; tr.append(max(h-l,abs(h-pc),abs(l-pc)))
  return sum(tr[-n:])/min(n,len(tr)) if tr else 0
 TF={'5m':'Min5','15m':'Min15','1h':'Min60','4h':'Hour4'}
+# Lookback window (seconds) per timeframe, used only to size the kline `start` param. Centralized and
+# kept in lockstep with TF above so every supported timeframe (including 5m, used by the Momentum and
+# Entry Timing Lab research models) has an entry - a missing key here previously made every 5m kline
+# request fail with KeyError before any network call, silently starving both research models of data.
+TF_SECONDS={'5m':300,'15m':900,'1h':3600,'4h':14400}
 # Shared MEXC request gate: scanner, live prices and API tests use one throttle.
 mexc_request_lock=asyncio.Lock()
 mexc_last_request_at=0.0
@@ -481,7 +495,10 @@ async def mexc_get(client,url,**kwargs):
  return last_response
 
 async def klines(client,symbol,tf,limit=120):
- end=int(time.time()); seconds={'15m':900,'1h':3600,'4h':14400}[tf]; start=end-seconds*(limit+5)
+ end=int(time.time())
+ try: seconds=TF_SECONDS[tf]
+ except KeyError: raise ValueError(f'Desteklenmeyen timeframe: {tf!r} (destekleniyor: {sorted(TF_SECONDS)})')
+ start=end-seconds*(limit+5)
  url=f'https://api.mexc.com/api/v1/contract/kline/{symbol}'
  r=await mexc_get(client,url,params={'interval':TF[tf],'start':start,'end':end},timeout=15)
  body=r.text
@@ -1326,21 +1343,34 @@ def _completed_5m_snapshot(rows,now=None):
   'volume_ratio':(sum(vols[-5:])/5)/(sum(vols[-25:-5])/20 or 1)}
 
 def _entry_timing_evaluate(candidate,candle,reference_price,now=None):
+ """MEXC_GOREV_04 ordering fix: a completed candle within the candidate's window is evaluated for
+ confirmation FIRST (candle's own close decides both the OHLC/RSI/volume conditions and the chase
+ gate below), and the live-reference-price chase/timeout check only runs as a fallback for a
+ candidate that is still PENDING after that - never before. This mirrors the momentum model and
+ prevents a live price spike from terminal-chasing a candidate before an already-completed,
+ already-confirming candle is ever looked at."""
  now=now or datetime.now(); original=float(candidate['original_current_entry_price'])
  original_risk=abs(original-(original-float(candidate['original_atr'])*float(settings['stop_atr_mult'])))
  original_risk=max(original_risk,original*.002)
  move=reference_price-original; move_r=move/original_risk if original_risk else 0.0
  common={'price_move_from_original_pct':move/(original or 1)*100,'price_move_from_original_r':move_r}
+ expires_at=datetime.fromisoformat(candidate['expires_at'])
+ has_new_candle=(candle is not None
+  and datetime.fromisoformat(candle['closed_at'])>datetime.fromisoformat(candidate['candidate_created_at'])
+  and datetime.fromisoformat(candle['closed_at'])<=expires_at)  # never confirm on a post-expiry candle
+ if has_new_candle:
+  candle_move_r=(candle['close']-original)/original_risk if original_risk else 0.0
+  baseline=candidate.get('original_5m_rsi')
+  confirmed=(candle['close']>candle['open'] and candle['close']>candle['previous_close']
+   and (baseline is None or candle['rsi']>=float(baseline)) and candle['volume_ratio']>=0.8
+   and candle_move_r<ENTRY_TIMING_CHASE_R)
+  if confirmed:
+   return {'action':'CONFIRMED',**common}
  if move_r>=ENTRY_TIMING_CHASE_R:
   return {'action':'CHASED_EXPIRED','reason':'CHASED_GTE_0_75R',**common}
- if now>=datetime.fromisoformat(candidate['expires_at']):
+ if now>=expires_at:
   return {'action':'NO_CONFIRMATION_TIMEOUT','reason':'NO_CONFIRMATION_TIMEOUT',**common}
- if not candle or datetime.fromisoformat(candle['closed_at'])<=datetime.fromisoformat(candidate['candidate_created_at']):
-  return {'action':'PENDING',**common}
- baseline=candidate.get('original_5m_rsi')
- confirmed=(candle['close']>candle['open'] and candle['close']>candle['previous_close']
-  and (baseline is None or candle['rsi']>=float(baseline)) and candle['volume_ratio']>=0.8)
- return {'action':'CONFIRMED' if confirmed else 'PENDING',**common}
+ return {'action':'PENDING',**common}
 
 def _update_entry_timing_candidate(c,candidate,candle,reference_price,now=None):
  now=now or datetime.now(); now_iso=now.isoformat(timespec='seconds')
@@ -1405,10 +1435,14 @@ def _momentum_5m_preliminary(candidate,reference_price,now=None):
   return {'action':'NO_MOMENTUM_TIMEOUT','reason':'NO_MOMENTUM_TIMEOUT','pct':pct,'move_r':move_r}
  return {'action':'PENDING','pct':pct,'move_r':move_r}
 
-def _momentum_5m_completed_candles(rows,since_iso,now=None):
- """Ordered completed 5m candles strictly after candidate creation. Each candle's RSI/volume_ratio
- use only closes/volumes known up to and including that candle - no lookahead into future candles."""
+def _momentum_5m_completed_candles(rows,since_iso,now=None,until_iso=None):
+ """Ordered completed 5m candles strictly after candidate creation and, if `until_iso` is given
+ (the candidate's expires_at), strictly before it - a candle opening at/after expiry belongs to the
+ live chase/timeout fallback, never to confirmation (MEXC_GOREV_04: no post-expiry confirmation).
+ Each candle's RSI/volume_ratio use only closes/volumes known up to and including that candle - no
+ lookahead into future candles."""
  now=now or datetime.now(); cutoff=now.timestamp(); since_ts=datetime.fromisoformat(since_iso).timestamp()
+ until_ts=datetime.fromisoformat(until_iso).timestamp() if until_iso else None
  complete=[x for x in rows if float(x[0])+300<=cutoff]
  if len(complete)<26:return []
  closes=[x[4] for x in complete]; vols=[x[5] for x in complete]
@@ -1416,6 +1450,7 @@ def _momentum_5m_completed_candles(rows,since_iso,now=None):
  for i in range(25,len(complete)):
   ts=float(complete[i][0])
   if ts<=since_ts:continue
+  if until_ts is not None and ts>=until_ts:break
   window_closes=closes[:i+1]; window_vols=vols[:i+1]
   out.append({'opened_at':ts,'closed_at':ts+300,
    'open':complete[i][1],'high':complete[i][2],'low':complete[i][3],'close':complete[i][4],
@@ -1514,19 +1549,40 @@ def _manage_momentum_5m_shadows_once(c):
    result['mae'],result['mae_r'],result['mfe'],result['mfe_r'],result['gross_pnl'],result['fee_paid'],
    result['net_pnl'],result.get('exit_price'),result.get('close_reason'),now if result['closed'] else None,now,row['id']))
 
+_RESEARCH_ERROR_LOG_DEDUP={}
+RESEARCH_ERROR_LOG_INTERVAL_SECONDS=300  # don't spam the log/journal more than once per key per 5 min
+
+def _research_model_state_prefix(model_name):
+ return 'momentum_5m_entry' if model_name=='MOMENTUM_5M_ENTRY' else 'entry_timing_lab'
+
+def _research_error(model_name,candidate,exc):
+ """Record a candle-fetch/evaluation failure for one research candidate: safe (no secret), typed,
+ rate-limited/deduped per (model,symbol,candidate_id,error_type) so a persistent feed/API error can't
+ spam the log every scan cycle, but still visible via state/API on every occurrence."""
+ now=datetime.now(); now_iso=now.isoformat(timespec='seconds')
+ error_type=type(exc).__name__; message=f'{error_type}: {str(exc)[:200]}'
+ prefix=_research_model_state_prefix(model_name)
+ state[f'{prefix}_error']=message; state[f'{prefix}_last_error_at']=now_iso
+ key=(model_name,candidate.get('symbol'),candidate.get('id'),error_type)
+ last_logged=_RESEARCH_ERROR_LOG_DEDUP.get(key)
+ if last_logged is None or (now.timestamp()-last_logged)>=RESEARCH_ERROR_LOG_INTERVAL_SECONDS:
+  _RESEARCH_ERROR_LOG_DEDUP[key]=now.timestamp()
+  log(f"{model_name} #{candidate.get('id')} {candidate.get('symbol')} hata: {message}",'WARN')
+
+def _research_success(model_name):
+ """Clear a model's active-error flag and stamp the last successful evaluation cycle, so a resolved
+ error stops appearing as if it were still happening."""
+ prefix=_research_model_state_prefix(model_name)
+ state[f'{prefix}_error']=None; state[f'{prefix}_last_success_at']=datetime.now().isoformat(timespec='seconds')
+
 async def manage_entry_timing_candidates(client):
  c=db(); pending=[dict(x) for x in c.execute("SELECT * FROM entry_timing_lab_candidates WHERE confirmation_status='PENDING'").fetchall()]; c.close()
  if not pending:return
  for candidate in pending:
   try:
-   reference=float((state.get('live_prices') or {}).get(candidate['symbol']) or 0)
-   if reference>0:
-    preliminary=_entry_timing_evaluate(candidate,None,reference)
-    if preliminary['action'] in ('CHASED_EXPIRED','NO_CONFIRMATION_TIMEOUT'):
-     def expire(c):return _update_entry_timing_candidate(c,candidate,None,reference)
-     action=_sqlite_write_with_retry(expire)
-     log(f"ENTRY_TIMING_LAB #{candidate['id']} {candidate['symbol']} {action}",'RESEARCH')
-     continue
+   # Fetch and evaluate the latest completed 5m candle FIRST (MEXC_GOREV_04 ordering fix); a data/API
+   # error here raises before any DB write, so the candidate is left untouched (safe recovery) and
+   # simply retried next cycle - it is never wrongly terminal-chased/timed-out on a data failure.
    rows=await limited_klines(client,candidate['symbol'],'5m',40)
    candle=_completed_5m_snapshot(rows)
    reference=float((state.get('live_prices') or {}).get(candidate['symbol']) or (candle or {}).get('close') or 0)
@@ -1534,35 +1590,41 @@ async def manage_entry_timing_candidates(client):
    def write(c):return _update_entry_timing_candidate(c,candidate,candle,reference)
    action=_sqlite_write_with_retry(write)
    if action!='PENDING':log(f"ENTRY_TIMING_LAB #{candidate['id']} {candidate['symbol']} {action}",'RESEARCH')
+   _research_success('ENTRY_TIMING_LAB')
   except Exception as e:
-   state['entry_timing_lab_error']=f'{type(e).__name__}: {e}'
+   _research_error('ENTRY_TIMING_LAB',candidate,e)
 
 async def manage_momentum_5m_candidates(client):
  c=db(); pending=[dict(x) for x in c.execute("SELECT * FROM momentum_5m_entry_candidates WHERE confirmation_status='PENDING'").fetchall()]; c.close()
  if not pending:return
  for candidate in pending:
   try:
-   reference=float((state.get('live_prices') or {}).get(candidate['symbol']) or 0)
-   if reference>0:
-    preliminary=_momentum_5m_preliminary(candidate,reference)
-    if preliminary['action']!='PENDING':
-     def expire(c):
-      c.execute('''UPDATE momentum_5m_entry_candidates SET confirmation_status=?,terminal_reason=?,
-       price_move_from_original_pct=?,price_move_from_original_r=?,updated_at=?
-       WHERE id=? AND confirmation_status='PENDING' ''',
-       (preliminary['action'],preliminary['reason'],preliminary['pct'],preliminary['move_r'],
-        datetime.now().isoformat(timespec='seconds'),candidate['id']))
-      return preliminary['action']
-     action=_sqlite_write_with_retry(expire)
-     log(f"MOMENTUM_5M_ENTRY #{candidate['id']} {candidate['symbol']} {action}",'RESEARCH')
-     continue
+   # Fetch and chronologically evaluate every completed-but-unprocessed 5m candle in the candidate's
+   # window FIRST (MEXC_GOREV_04 ordering fix); only if the candidate is still PENDING afterwards does
+   # the live-price +0.75R chase / timeout fallback run - it can no longer terminal-chase a candidate
+   # before an already-completed, already-confirming candle is looked at. A klines()/data error raises
+   # before any DB write, so the candidate is left PENDING untouched and retried next cycle.
    rows=await limited_klines(client,candidate['symbol'],'5m',40)
-   candles=_momentum_5m_completed_candles(rows,candidate['candidate_created_at'])
+   candles=_momentum_5m_completed_candles(rows,candidate['candidate_created_at'],until_iso=candidate['expires_at'])
    def write(c):return _update_momentum_5m_candidate(c,candidate,candles)
    action=_sqlite_write_with_retry(write)
+   if action=='PENDING':
+    reference=float((state.get('live_prices') or {}).get(candidate['symbol']) or 0)
+    if reference>0:
+     preliminary=_momentum_5m_preliminary(candidate,reference)
+     if preliminary['action']!='PENDING':
+      def expire(c):
+       c.execute('''UPDATE momentum_5m_entry_candidates SET confirmation_status=?,terminal_reason=?,
+        price_move_from_original_pct=?,price_move_from_original_r=?,updated_at=?
+        WHERE id=? AND confirmation_status='PENDING' ''',
+        (preliminary['action'],preliminary['reason'],preliminary['pct'],preliminary['move_r'],
+         datetime.now().isoformat(timespec='seconds'),candidate['id']))
+       return preliminary['action']
+      action=_sqlite_write_with_retry(expire)
    if action!='PENDING':log(f"MOMENTUM_5M_ENTRY #{candidate['id']} {candidate['symbol']} {action}",'RESEARCH')
+   _research_success('MOMENTUM_5M_ENTRY')
   except Exception as e:
-   state['momentum_5m_entry_error']=f'{type(e).__name__}: {e}'
+   _research_error('MOMENTUM_5M_ENTRY',candidate,e)
 
 def _sync_entry_quality_v2_research_once(c):
  now=datetime.now().isoformat(timespec='seconds')
@@ -2249,6 +2311,20 @@ def _entry_timing_trade_metrics(rows):
   'fee_total':sum(float(x.get('fee') or 0) for x in closed),
   'profit_retention':sum(pnls)/sum(gross)*100 if sum(gross)>0 else 0.0}
 
+def _research_version_breakdown(candidates,confirmed_statuses):
+ """Per-`version` candidate counts (MEXC_GOREV_04: pre-fix/post-fix cohort separation). The
+ `version` column is stamped once at candidate creation from the model's version constant, so old
+ rows keep their pre-fix version string forever - this never rewrites or recomputes history, it only
+ groups the existing, untouched rows by the version they were created under."""
+ breakdown={}
+ for x in candidates:
+  b=breakdown.setdefault(x['version'],{'total':0,'confirmed':0,'pending':0,'terminal_unconfirmed':0})
+  b['total']+=1; st=x['confirmation_status']
+  if st=='PENDING':b['pending']+=1
+  elif st in confirmed_statuses:b['confirmed']+=1
+  else:b['terminal_unconfirmed']+=1
+ return breakdown
+
 @app.get('/api/entry-timing-lab')
 def entry_timing_lab():
  c=db(); meta=c.execute('SELECT deployed_at FROM entry_timing_lab_meta WHERE version=?',(ENTRY_TIMING_LAB_VERSION,)).fetchone()
@@ -2268,12 +2344,15 @@ def entry_timing_lab():
  confirmed_candidates=[x for x in candidates if x['confirmation_status'] in ('OPEN','CLOSED')]
  return {'model':ENTRY_TIMING_LAB_MODEL,'version':ENTRY_TIMING_LAB_VERSION,
   'deployed_at':meta['deployed_at']+'Z' if meta else None,'error':state.get('entry_timing_lab_error'),
+  'last_error_at':state.get('entry_timing_lab_last_error_at'),
+  'last_success_at':state.get('entry_timing_lab_last_success_at'),
   'total_candidates':len(candidates),'confirmed_count':len(confirmed_candidates),
   'confirmation_rate':_safe_rate(len(confirmed_candidates),len(candidates)),
   'timeout_count':sum(x['confirmation_status']=='NO_CONFIRMATION_TIMEOUT' for x in candidates),
   'chased_expired_count':sum(x['confirmation_status']=='CHASED_EXPIRED' for x in candidates),
   'average_confirmation_delay':sum(float(x.get('confirmation_delay_seconds') or 0) for x in confirmed_candidates)/len(confirmed_candidates) if confirmed_candidates else 0.0,
   'closed_matched_count':len(shadow_rows),'current':current,'confirmed':confirmed,'delta':delta,
+  'version_breakdown':_research_version_breakdown(candidates,('OPEN','CLOSED')),
   'rows':list(reversed(candidates[-200:]))}
 
 @app.get('/api/momentum-5m-entry')
@@ -2325,6 +2404,8 @@ def momentum_5m_entry():
  return {'model':MOMENTUM_5M_ENTRY_MODEL,'version':MOMENTUM_5M_ENTRY_VERSION,
   'deployed_at':meta['deployed_at']+'Z' if meta else None,'params':params,
   'error':state.get('momentum_5m_entry_error'),
+  'last_error_at':state.get('momentum_5m_entry_last_error_at'),
+  'last_success_at':state.get('momentum_5m_entry_last_success_at'),
   'total_candidates':len(candidates),'pending_count':sum(x['confirmation_status']=='PENDING' for x in candidates),
   'confirmed_count':len(confirmed_candidates),
   'confirmation_rate':_safe_rate(len(confirmed_candidates),len(candidates)),
@@ -2335,6 +2416,7 @@ def momentum_5m_entry():
   'average_confirmation_move_r':sum(float(x.get('price_move_from_original_r') or 0) for x in confirmed_candidates)/len(confirmed_candidates) if confirmed_candidates else 0.0,
   'closed_matched_count':len(shadow_rows),'current_matched':current,'momentum':momentum,'delta':delta,
   'failure_analytics':failure_analytics,
+  'version_breakdown':_research_version_breakdown(candidates,('CONFIRMED','CLOSED')),
   'rows':list(reversed(candidates[-200:])),
   'candle_evaluations':list(reversed(candle_evals))[:200]}
 

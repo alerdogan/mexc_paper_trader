@@ -39,7 +39,7 @@ def test_current_unchanged_and_candidate_matches_long_only(isolated_app):
     c.close()
     assert position["status"] == "OPEN" and position["entry"] == pytest.approx(100)
     assert row["confirmation_status"] == "PENDING"
-    assert row["model"] == "MOMENTUM_5M_ENTRY" and row["version"] == "MOMENTUM_5M_ENTRY_V1"
+    assert row["model"] == "MOMENTUM_5M_ENTRY" and row["version"] == module.MOMENTUM_5M_ENTRY_VERSION
     assert row["original_current_entry_price"] == pytest.approx(100) and row["original_atr"] == pytest.approx(1.0)
     assert module.current_paper_balance() == pytest.approx(4000 - position["fee_paid"])
     # CONFIRMED_5M_ENTRY_V1 candidate for the same position must also exist, untouched by this task.
